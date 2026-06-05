@@ -71,13 +71,19 @@ namespace NetworkLibrary
         public void Start(int port, int receiveThreads = 0)
         {
             if (IsRunning) throw new InvalidOperationException("Manager is already running");
-            IsRunning = true;
 
-            // Auto-detect optimal thread count for the current OS
+            // Auto-detect optimal thread count for the current OS.
+            // Capped at 4: receive scales sub-linearly (1 thread already handles ~600k pkt/s),
+            // so we leave the rest of the cores for the game simulation.
             if (receiveThreads <= 0)
             {
-                receiveThreads = OperatingSystem.IsLinux() ? Math.Max(1, Environment.ProcessorCount / 2) : 1;
+                receiveThreads = OperatingSystem.IsLinux()
+                    ? Math.Clamp(Environment.ProcessorCount / 2, 1, 4)
+                    : 1;
             }
+
+            try
+            {
 
             if (_transportType == TransportType.Udp)
             {
@@ -156,6 +162,20 @@ namespace NetworkLibrary
                 };
 
                 _tcpServer.Start(port);
+            }
+
+            // Only mark as running once everything bound/started successfully.
+            IsRunning = true;
+            }
+            catch
+            {
+                // Bind failed (e.g. port in use) — roll back so Start can be retried.
+                _udpServer?.Stop();
+                _tcpServer?.Stop();
+                _udpServer = null;
+                _tcpServer = null;
+                IsRunning = false;
+                throw;
             }
         }
 
