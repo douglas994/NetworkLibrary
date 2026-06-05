@@ -44,6 +44,13 @@ namespace NetworkLibrary.Transport
         /// <summary>Remote endpoint address.</summary>
         public EndPoint RemoteEndPoint { get; internal set; }
 
+        /// <summary>
+        /// Pre-serialized destination address, cached once at accept time.
+        /// Lets the send path call Socket.SendTo(span, flags, SocketAddress) without
+        /// re-serializing the IPEndPoint (and allocating a SocketAddress) on every packet.
+        /// </summary>
+        internal System.Net.SocketAddress? _sendAddress;
+
         /// <summary>Zero-allocation internal address key.</summary>
         internal PeerAddress InternalAddress { get; set; }
 

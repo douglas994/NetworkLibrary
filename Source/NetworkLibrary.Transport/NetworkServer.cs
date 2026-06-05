@@ -122,29 +122,28 @@ namespace NetworkLibrary.Transport
         }
 
         /// <summary>
-        /// Enables SO_REUSEPORT mode for Linux: spawns <paramref name="workerCount"/> parallel
-        /// receive sockets on the same port. The Linux kernel distributes packets by 5-tuple hash,
-        /// so each peer always lands on the same socket — no per-peer locking needed.
+        /// Enables parallel packet reception with <paramref name="workerCount"/> receive threads.
+        /// <list type="bullet">
+        /// <item>On Linux: spawns <paramref name="workerCount"/> sockets with SO_REUSEPORT, so the
+        /// kernel load-balances datagrams by 5-tuple hash (each peer always lands on the same socket).</item>
+        /// <item>On Windows (no SO_REUSEPORT load-balancing): spawns <paramref name="workerCount"/> threads
+        /// that all call ReceiveFrom on a single shared socket. The OS hands each datagram to one waiting
+        /// thread, which still scales receive throughput past a single thread's syscall ceiling.</item>
+        /// </list>
         /// Must be called BEFORE <see cref="Start"/>.
-        /// Has no effect on Windows (falls back silently to single-socket mode).
         /// </summary>
-        /// <param name="workerCount">Number of sockets/threads. Recommended: Environment.ProcessorCount / 2.</param>
+        /// <param name="workerCount">Number of receive threads. Recommended: Environment.ProcessorCount / 2.</param>
         public void EnableReusePort(int workerCount)
         {
             if (_isRunning)
                 throw new InvalidOperationException("Cannot enable ReusePort after Start()");
 
-            // SO_REUSEPORT load-balancing only works on Linux 3.9+
-            // On Windows it acts like SO_REUSEADDR and does NOT load-balance — silently use 1 socket.
-            if (!OperatingSystem.IsLinux())
-            {
-                Console.WriteLine("[NetworkServer] SO_REUSEPORT: not Linux, falling back to single-socket mode.");
-                _reusePortWorkers = 1;
-                return;
-            }
-
             _reusePortWorkers = Math.Max(1, workerCount);
-            Console.WriteLine($"[NetworkServer] SO_REUSEPORT enabled: {_reusePortWorkers} worker sockets.");
+
+            if (OperatingSystem.IsLinux())
+                Console.WriteLine($"[NetworkServer] SO_REUSEPORT enabled: {_reusePortWorkers} load-balanced sockets.");
+            else
+                Console.WriteLine($"[NetworkServer] Multi-threaded receive: {_reusePortWorkers} threads on 1 shared socket.");
         }
 
         /// <summary>
@@ -155,11 +154,17 @@ namespace NetworkLibrary.Transport
             if (_isRunning)
                 throw new InvalidOperationException("Server is already running");
 
-            int workerCount = _reusePortWorkers;
-            _sockets = new Socket[workerCount];
+            int workerCount = Math.Max(1, _reusePortWorkers);
+
+            // Linux: one SO_REUSEPORT socket per thread (kernel load-balances).
+            // Windows: one shared socket, multiple threads calling ReceiveFrom on it.
+            bool useReusePort = OperatingSystem.IsLinux() && workerCount > 1;
+            int socketCount = useReusePort ? workerCount : 1;
+
+            _sockets = new Socket[socketCount];
             _receiveThreads = new Thread[workerCount];
 
-            for (int i = 0; i < workerCount; i++)
+            for (int i = 0; i < socketCount; i++)
             {
                 var addressFamily = ipv6 ? AddressFamily.InterNetworkV6 : AddressFamily.InterNetwork;
                 var socket = new Socket(addressFamily, SocketType.Dgram, ProtocolType.Udp);
@@ -177,7 +182,7 @@ namespace NetworkLibrary.Transport
                 catch { /* non-Windows */ }
 
                 // SO_REUSEPORT: enables kernel-level load balancing on Linux
-                if (workerCount > 1 && OperatingSystem.IsLinux())
+                if (useReusePort)
                 {
                     // Socket option 15 = SO_REUSEPORT on Linux
                     socket.SetSocketOption(SocketOptionLevel.Socket, (SocketOptionName)15, true);
@@ -194,22 +199,27 @@ namespace NetworkLibrary.Transport
                 }
 
                 _sockets[i] = socket;
+            }
 
-                int workerIndex = i; // capture for lambda
-                var thread = new Thread(() => ReceiveLoop(workerIndex))
+            // Spawn receive threads. On Linux each thread owns its socket; on Windows all
+            // threads share socket[0] (the OS distributes datagrams across waiting threads).
+            for (int t = 0; t < workerCount; t++)
+            {
+                int socketIndex = useReusePort ? t : 0;
+                var thread = new Thread(() => ReceiveLoop(socketIndex))
                 {
-                    Name = $"NetServer_Recv_{workerIndex}",
+                    Name = $"NetServer_Recv_{t}",
                     IsBackground = true,
                     Priority = ThreadPriority.Highest
                 };
-                _receiveThreads[i] = thread;
+                _receiveThreads[t] = thread;
             }
 
             _isRunning = true;
 
             // Start all receive threads after all sockets are bound
-            for (int i = 0; i < workerCount; i++)
-                _receiveThreads[i].Start();
+            for (int t = 0; t < workerCount; t++)
+                _receiveThreads[t].Start();
         }
 
         /// <summary>
@@ -312,8 +322,9 @@ namespace NetworkLibrary.Transport
         /// </summary>
         public void SendToAll(byte[] data, int offset, int length, DeliveryMethod delivery)
         {
-            foreach (var peer in _peersByEndPoint.Values)
+            foreach (var kvp in _peersByEndPoint)
             {
+                var peer = kvp.Value;
                 if (peer.State == PeerState.Connected)
                 {
                     Send(peer, data, offset, length, delivery);
@@ -326,8 +337,9 @@ namespace NetworkLibrary.Transport
         /// </summary>
         public void SendToAllExcept(NetworkPeer excludedPeer, byte[] data, int offset, int length, DeliveryMethod delivery)
         {
-            foreach (var peer in _peersByEndPoint.Values)
+            foreach (var kvp in _peersByEndPoint)
             {
+                var peer = kvp.Value;
                 if (peer.State == PeerState.Connected && peer != excludedPeer)
                 {
                     Send(peer, data, offset, length, delivery);
@@ -534,27 +546,50 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
 
         private void ProcessRetransmissions()
         {
-            foreach (var peer in _peersByEndPoint.Values)
+            // Iterate the dictionary directly (struct enumerator, no per-tick snapshot
+            // allocation — unlike .Values which copies every value into a new List).
+            foreach (var kvp in _peersByEndPoint)
             {
+                var peer = kvp.Value;
                 if (peer.State != PeerState.Connected)
                     continue;
 
+                var reliable = peer._reliableChannel;
+                var ordered = peer._reliableOrderedChannel;
+
+                // Fast path: skip peers with nothing in flight on either channel.
+                if (!reliable.HasUnackedPackets && !ordered.HasUnackedPackets)
+                    continue;
+
                 // Retransmit for reliable channel
-                int count = peer._reliableChannel.GetPacketsToRetransmit(_retransmitBuffer, _retransmitBuffer.Length);
-                for (int i = 0; i < count; i++)
+                if (reliable.HasUnackedPackets)
                 {
-                    ref var pkt = ref _retransmitBuffer[i];
-                    peer._reliableChannel.GenerateAckData(out var ack, out var ackBits);
-                    SendRawPacket(peer, DeliveryMethod.Reliable, pkt.Sequence, ack, ackBits, pkt.Data, 0, pkt.DataLength);
+                    int count = reliable.GetPacketsToRetransmit(_retransmitBuffer, _retransmitBuffer.Length);
+                    if (count > 0)
+                    {
+                        // ACK state is identical for every packet in this batch — compute once.
+                        reliable.GenerateAckData(out var ack, out var ackBits);
+                        for (int i = 0; i < count; i++)
+                        {
+                            ref var pkt = ref _retransmitBuffer[i];
+                            SendRawPacket(peer, DeliveryMethod.Reliable, pkt.Sequence, ack, ackBits, pkt.Data, 0, pkt.DataLength);
+                        }
+                    }
                 }
 
                 // Retransmit for reliable ordered channel
-                count = peer._reliableOrderedChannel.GetPacketsToRetransmit(_retransmitBuffer, _retransmitBuffer.Length);
-                for (int i = 0; i < count; i++)
+                if (ordered.HasUnackedPackets)
                 {
-                    ref var pkt = ref _retransmitBuffer[i];
-                    peer._reliableOrderedChannel.GenerateAckData(out var ack, out var ackBits);
-                    SendRawPacket(peer, DeliveryMethod.ReliableOrdered, pkt.Sequence, ack, ackBits, pkt.Data, 0, pkt.DataLength);
+                    int count = ordered.GetPacketsToRetransmit(_retransmitBuffer, _retransmitBuffer.Length);
+                    if (count > 0)
+                    {
+                        ordered.GenerateAckData(out var ack, out var ackBits);
+                        for (int i = 0; i < count; i++)
+                        {
+                            ref var pkt = ref _retransmitBuffer[i];
+                            SendRawPacket(peer, DeliveryMethod.ReliableOrdered, pkt.Sequence, ack, ackBits, pkt.Data, 0, pkt.DataLength);
+                        }
+                    }
                 }
             }
         }
@@ -563,8 +598,9 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
         {
             long now = Stopwatch.GetTimestamp();
 
-            foreach (var peer in _peersByEndPoint.Values)
+            foreach (var kvp in _peersByEndPoint)
             {
+                var peer = kvp.Value;
                 // Timeout check
                 if (peer.State == PeerState.Connected && (now - peer.LastReceiveTime) > _connectionTimeout)
                 {
@@ -592,29 +628,38 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
             if (_peersByEndPoint.Count >= _maxPeers)
                 return null;
 
-            // Use GetOrAdd to handle the race where two threads might accept the same new peer
-            NetworkPeer? newPeer = null;
-            var peer = _peersByEndPoint.GetOrAdd(peerAddr, _ =>
-            {
-                if (!_peerPool.TryTake(out newPeer))
-                    newPeer = new NetworkPeer();
+            // Fast path: already known peer, no allocation, no candidate setup.
+            if (_peersByEndPoint.TryGetValue(peerAddr, out var existing))
+                return existing;
 
-                newPeer.Reset();
-                newPeer.PeerId = (uint)Interlocked.Increment(ref _nextPeerId);
-                newPeer.RemoteEndPoint = peerAddr.ToIPEndPoint();
-                newPeer.InternalAddress = peerAddr;
-                newPeer.State = PeerState.Connected;
-                newPeer.LastReceiveTime = Stopwatch.GetTimestamp();
-                newPeer._lastPingTime = Stopwatch.GetTimestamp();
-                return newPeer;
-            });
+            // Prepare a candidate peer (pooled). Using the GetOrAdd(key, value) overload
+            // instead of GetOrAdd(key, factory) avoids allocating a closure on every
+            // connection attempt. If we lose the race, the candidate is returned to the pool.
+            if (!_peerPool.TryTake(out var candidate))
+                candidate = new NetworkPeer();
 
-            // Only fire events for truly new peers
-            if (peer == newPeer)
+            candidate.Reset();
+            candidate.PeerId = (uint)Interlocked.Increment(ref _nextPeerId);
+            candidate.RemoteEndPoint = peerAddr.ToIPEndPoint();
+            candidate._sendAddress = candidate.RemoteEndPoint.Serialize(); // cache for zero-alloc sends
+            candidate.InternalAddress = peerAddr;
+            candidate.State = PeerState.Connected;
+            candidate.LastReceiveTime = Stopwatch.GetTimestamp();
+            candidate._lastPingTime = Stopwatch.GetTimestamp();
+
+            var peer = _peersByEndPoint.GetOrAdd(peerAddr, candidate);
+
+            if (peer == candidate)
             {
+                // We won the race — register and fire events.
                 _peersById[peer.PeerId] = peer;
                 SendInternalPacket(peer, InternalPacketType.ConnectAccept);
                 OnPeerConnected?.Invoke(peer);
+            }
+            else
+            {
+                // Another thread added this peer first — recycle our unused candidate.
+                _peerPool.Add(candidate);
             }
 
             return peer;
@@ -680,20 +725,16 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
 
         internal void SendInternalPacket(NetworkPeer peer, InternalPacketType type)
         {
-            lock (peer)
-            {
-                byte[] buf = _bufferPool.Rent(PacketHeader.SafeMTU);
-                buf[PacketHeader.HeaderSize] = (byte)type;
+            // Stack buffer — thread-local, no pool, no lock needed.
+            const int totalLength = PacketHeader.HeaderSize + 1;
+            Span<byte> buf = stackalloc byte[totalLength];
 
-                peer._reliableChannel.GenerateAckData(out var ack, out var ackBits);
-                PacketHeader.Write(buf, DeliveryMethod.Internal, 0, ack, ackBits, 1);
+            peer._reliableChannel.GenerateAckData(out var ack, out var ackBits);
+            PacketHeader.Write(buf, DeliveryMethod.Internal, 0, ack, ackBits, 1);
+            buf[PacketHeader.HeaderSize] = (byte)type;
 
-                int totalLength = PacketHeader.HeaderSize + 1;
-                SendRawTo(peer.RemoteEndPoint, buf, totalLength);
-
-                peer.LastSendTime = Stopwatch.GetTimestamp();
-                _bufferPool.Return(buf);
-            }
+            SendRawTo(peer, buf);
+            peer.LastSendTime = Stopwatch.GetTimestamp();
         }
 
         private void ProcessInternalPacket(NetworkPeer peer, byte[] data, int offset, int length)
@@ -725,28 +766,51 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
 
         private void SendRawPacket(NetworkPeer peer, DeliveryMethod delivery, ushort sequence, ushort ack, uint ackBits, byte[] data, int offset, int length)
         {
-            lock (peer)
+            int totalLength = PacketHeader.HeaderSize + length;
+
+            // Common case (fits in one datagram): build the packet on the stack — no lock,
+            // no pool rent/return, so concurrent broadcast threads never contend on the pool.
+            if (totalLength <= PacketHeader.SafeMTU)
             {
-                int totalLength = PacketHeader.HeaderSize + length;
-                byte[] buf = _bufferPool.Rent(totalLength);
-                PacketHeader.Write(buf, delivery, sequence, ack, ackBits, (ushort)length);
-                Buffer.BlockCopy(data, offset, buf, PacketHeader.HeaderSize, length);
-
-                SendRawTo(peer.RemoteEndPoint, buf, totalLength);
-
-                peer.LastSendTime = Stopwatch.GetTimestamp();
-                _bufferPool.Return(buf);
+                Span<byte> packet = stackalloc byte[totalLength];
+                PacketHeader.Write(packet, delivery, sequence, ack, ackBits, (ushort)length);
+                data.AsSpan(offset, length).CopyTo(packet.Slice(PacketHeader.HeaderSize));
+                SendRawTo(peer, packet);
             }
+            else
+            {
+                // Oversized (e.g. large Unreliable that bypasses fragmentation) — fall back to the pool.
+                byte[] rented = _bufferPool.Rent(totalLength);
+                PacketHeader.Write(rented, delivery, sequence, ack, ackBits, (ushort)length);
+                Buffer.BlockCopy(data, offset, rented, PacketHeader.HeaderSize, length);
+                SendRawTo(peer, rented.AsSpan(0, totalLength));
+                _bufferPool.Return(rented);
+            }
+
+            peer.LastSendTime = Stopwatch.GetTimestamp();
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void SendRawTo(EndPoint endPoint, byte[] data, int length)
+        private void SendRawTo(NetworkPeer peer, ReadOnlySpan<byte> data)
         {
             try
             {
                 // Always send from the primary socket (socket 0).
                 // In SO_REUSEPORT mode the kernel routes replies correctly regardless of which socket sends.
-                Simulator.Send(_sockets![0], data, 0, length, endPoint);
+                if (Simulator.Enabled)
+                {
+                    // The simulator's delay queue needs a byte[]; rent a temporary copy.
+                    byte[] tmp = _bufferPool.Rent(data.Length);
+                    data.CopyTo(tmp);
+                    Simulator.Send(_sockets![0], tmp, 0, data.Length, peer.RemoteEndPoint);
+                    _bufferPool.Return(tmp);
+                }
+                else
+                {
+                    // Use the cached, pre-serialized SocketAddress — avoids allocating and
+                    // serializing an IPEndPoint on every single send.
+                    _sockets![0].SendTo(data, SocketFlags.None, peer._sendAddress!);
+                }
             }
             catch (SocketException)
             {

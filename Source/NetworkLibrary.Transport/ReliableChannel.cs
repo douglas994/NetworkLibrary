@@ -80,6 +80,16 @@ namespace NetworkLibrary.Transport
         /// <summary>Total packets detected as lost.</summary>
         public int PacketsLost => _packetsLost;
 
+        /// <summary>
+        /// Cheap O(1) check: true if there are packets sent but not yet acknowledged.
+        /// Used to skip the full retransmit scan for idle channels.
+        /// </summary>
+        public bool HasUnackedPackets
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => _oldestUnackedSequence != _localSequence;
+        }
+
         public ReliableChannel()
         {
             _sendBuffer = new PendingPacket[WindowSize];

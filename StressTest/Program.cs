@@ -100,7 +100,7 @@ namespace StressTest
             listener.NetworkReceiveEvent += (peer, reader, method) =>
             {
                 Interlocked.Increment(ref packetsReceived);
-                Interlocked.Add(ref bytesReceived, reader.Length / 8);
+                Interlocked.Add(ref bytesReceived, reader.Length); // BitBuffer.Length is already in bytes
 
                 // Read Movement Data
                 byte type = reader.ReadByte();
@@ -130,7 +130,10 @@ namespace StressTest
                 server.Simulator.PacketLossPercent = 5f; // 5% packet loss for robust testing
             }
 
-            server.Start(Port);
+            // Parallel receive: configurable via NL_RECV_THREADS env var (default 1) for A/B testing.
+            int recvThreads = int.TryParse(Environment.GetEnvironmentVariable("NL_RECV_THREADS"), out var rt) ? rt : 1;
+            server.Start(Port, recvThreads);
+            Console.WriteLine($"Receive threads: {recvThreads}");
             return server;
         }
 

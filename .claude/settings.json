@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs wc -l)",
+      "Bash(dotnet build *)",
+      "Bash(dotnet test *)",
+      "Bash(grep -iA 20 \"fail\\\\|error\\\\|exception\\\\|assert\")",
+      "Bash(grep -iA15 \"Assert\\\\|Expected\\\\|Actual\\\\|Exception\")",
+      "Bash(grep -iA12 \"Expected\\\\|Actual\\\\|Assert\\\\.\\\\|System\\\\.\")",
+      "Bash(mkdir -p /tmp/mywork)",
+      "Bash(cp Source/NetworkLibrary.Serialization/BitBuffer.cs /tmp/mywork/)",
+      "Bash(cp Source/NetworkLibrary.Serialization/BitBufferExtensions.cs /tmp/mywork/)",
+      "Bash(cp Tests/BitBufferTests.cs /tmp/mywork/)",
+      "Bash(git checkout *)",
+      "Bash(timeout 22 dotnet StressTest/bin/Release/net10.0/StressTest.dll)",
+      "Bash(timeout 25 dotnet StressTest/bin/Release/net10.0/StressTest.dll)",
+      "Bash(DOTNET_gcServer=0 DOTNET_gcConcurrent=1 timeout 22 dotnet StressTest/bin/Release/net10.0/StressTest.dll)"
+    ]
+  }
+}

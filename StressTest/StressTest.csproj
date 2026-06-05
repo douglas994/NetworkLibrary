@@ -9,6 +9,13 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+
+    <!-- Server-side runtime tuning: Server GC uses one heap+thread per core (far higher
+         throughput under concurrent load), background collection avoids GC pauses, and
+         TieredPGO lets the JIT specialize hot paths. These only apply to the executable. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <TieredPGO>true</TieredPGO>
   </PropertyGroup>
 
 </Project>

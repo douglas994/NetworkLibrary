@@ -5,6 +5,10 @@
  *  Extension methods for common MMORPG data types:
  *  Vector3 (with BoundedRange quantization), Quaternion (with SmallestThree),
  *  EntityId, HalfPrecision floats, etc.
+ *
+ *  IMPORTANT: All extensions use 'ref this BitBuffer' because BitBuffer is a struct.
+ *  Without ref, the struct is passed by value and _writePosition/_readPosition changes
+ *  inside the extension would NOT propagate back to the caller.
  */
 
 using System;
@@ -26,16 +30,16 @@ namespace NetworkLibrary.Serialization
         /// Writes a float as half-precision (16 bits). Saves 50% bandwidth.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static BitBuffer AddHalf(this BitBuffer buffer, float value)
+        public static void AddHalf(ref this BitBuffer buffer, float value)
         {
-            return buffer.AddRaw(16, HalfPrecision.Quantize(value));
+            buffer.AddRaw(16, HalfPrecision.Quantize(value));
         }
 
         /// <summary>
         /// Reads a half-precision float (16 bits).
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static float ReadHalf(this BitBuffer buffer)
+        public static float ReadHalf(ref this BitBuffer buffer)
         {
             return HalfPrecision.Dequantize((ushort)buffer.ReadRaw(16));
         }
@@ -49,20 +53,19 @@ namespace NetworkLibrary.Serialization
         /// Example: AddVector3(range, 150.5f, 20.3f, -88.7f)
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static BitBuffer AddVector3(this BitBuffer buffer, BoundedRange range, float x, float y, float z)
+        public static void AddVector3(ref this BitBuffer buffer, BoundedRange range, float x, float y, float z)
         {
             int bits = range.BitsRequired;
             buffer.AddRaw(bits, range.Quantize(x));
             buffer.AddRaw(bits, range.Quantize(y));
             buffer.AddRaw(bits, range.Quantize(z));
-            return buffer;
         }
 
         /// <summary>
         /// Reads a 3D position using BoundedRange dequantization.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void ReadVector3(this BitBuffer buffer, BoundedRange range, out float x, out float y, out float z)
+        public static void ReadVector3(ref this BitBuffer buffer, BoundedRange range, out float x, out float y, out float z)
         {
             int bits = range.BitsRequired;
             x = range.Dequantize(buffer.ReadRaw(bits));
@@ -74,19 +77,18 @@ namespace NetworkLibrary.Serialization
         /// Writes a 2D position using BoundedRange quantization.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static BitBuffer AddVector2(this BitBuffer buffer, BoundedRange range, float x, float y)
+        public static void AddVector2(ref this BitBuffer buffer, BoundedRange range, float x, float y)
         {
             int bits = range.BitsRequired;
             buffer.AddRaw(bits, range.Quantize(x));
             buffer.AddRaw(bits, range.Quantize(y));
-            return buffer;
         }
 
         /// <summary>
         /// Reads a 2D position using BoundedRange dequantization.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void ReadVector2(this BitBuffer buffer, BoundedRange range, out float x, out float y)
+        public static void ReadVector2(ref this BitBuffer buffer, BoundedRange range, out float x, out float y)
         {
             int bits = range.BitsRequired;
             x = range.Dequantize(buffer.ReadRaw(bits));
@@ -101,21 +103,20 @@ namespace NetworkLibrary.Serialization
         /// Writes a quaternion using SmallestThree compression (128 → 29 bits by default).
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static BitBuffer AddQuaternion(this BitBuffer buffer, float x, float y, float z, float w, int bitsPerComponent = 9)
+        public static void AddQuaternion(ref this BitBuffer buffer, float x, float y, float z, float w, int bitsPerComponent = 9)
         {
             QuantizedQuaternion q = SmallestThree.Quantize(x, y, z, w, bitsPerComponent);
             buffer.AddRaw(2, q.M);
             buffer.AddRaw(bitsPerComponent, q.A);
             buffer.AddRaw(bitsPerComponent, q.B);
             buffer.AddRaw(bitsPerComponent, q.C);
-            return buffer;
         }
 
         /// <summary>
         /// Reads a quaternion using SmallestThree decompression.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void ReadQuaternion(this BitBuffer buffer, out float x, out float y, out float z, out float w, int bitsPerComponent = 9)
+        public static void ReadQuaternion(ref this BitBuffer buffer, out float x, out float y, out float z, out float w, int bitsPerComponent = 9)
         {
             QuantizedQuaternion q = new QuantizedQuaternion(
                 buffer.ReadRaw(2),
@@ -136,16 +137,16 @@ namespace NetworkLibrary.Serialization
         /// Small IDs (0-127) use only 8 bits.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static BitBuffer AddEntityId(this BitBuffer buffer, uint entityId)
+        public static void AddEntityId(ref this BitBuffer buffer, uint entityId)
         {
-            return buffer.AddUIntVar(entityId);
+            buffer.AddUIntVar(entityId);
         }
 
         /// <summary>
         /// Reads an entity ID.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static uint ReadEntityId(this BitBuffer buffer)
+        public static uint ReadEntityId(ref this BitBuffer buffer)
         {
             return buffer.ReadUIntVar();
         }
@@ -159,19 +160,19 @@ namespace NetworkLibrary.Serialization
         /// Example: health percentage using 8 bits = 256 levels of precision.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static BitBuffer AddNormalized(this BitBuffer buffer, int numBits, float value)
+        public static void AddNormalized(ref this BitBuffer buffer, int numBits, float value)
         {
             uint maxVal = (1u << numBits) - 1;
             float clamped = Math.Clamp(value, 0f, 1f);
             uint quantized = (uint)(clamped * maxVal + 0.5f);
-            return buffer.AddRaw(numBits, quantized);
+            buffer.AddRaw(numBits, quantized);
         }
 
         /// <summary>
         /// Reads a normalized value (0.0 to 1.0).
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static float ReadNormalized(this BitBuffer buffer, int numBits)
+        public static float ReadNormalized(ref this BitBuffer buffer, int numBits)
         {
             uint maxVal = (1u << numBits) - 1;
             uint quantized = buffer.ReadRaw(numBits);
@@ -183,19 +184,19 @@ namespace NetworkLibrary.Serialization
         /// 10 bits = 0.35° precision, 8 bits = 1.4° precision.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static BitBuffer AddAngle(this BitBuffer buffer, int numBits, float degrees)
+        public static void AddAngle(ref this BitBuffer buffer, int numBits, float degrees)
         {
             uint maxVal = (1u << numBits) - 1;
             float normalized = ((degrees % 360f) + 360f) % 360f / 360f;
             uint quantized = (uint)(normalized * maxVal + 0.5f);
-            return buffer.AddRaw(numBits, quantized);
+            buffer.AddRaw(numBits, quantized);
         }
 
         /// <summary>
         /// Reads an angle in degrees (0-360).
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static float ReadAngle(this BitBuffer buffer, int numBits)
+        public static float ReadAngle(ref this BitBuffer buffer, int numBits)
         {
             uint maxVal = (1u << numBits) - 1;
             uint quantized = buffer.ReadRaw(numBits);

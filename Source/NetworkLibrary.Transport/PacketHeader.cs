@@ -76,7 +76,7 @@ namespace NetworkLibrary.Transport
         /// Writes a packet header into the destination buffer.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void Write(byte[] buffer, DeliveryMethod delivery, ushort sequence, ushort ack, uint ackBits, ushort dataLength)
+        public static void Write(Span<byte> buffer, DeliveryMethod delivery, ushort sequence, ushort ack, uint ackBits, ushort dataLength)
         {
             buffer[0] = ProtocolId;
             buffer[1] = (byte)delivery;

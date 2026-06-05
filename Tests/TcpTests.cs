@@ -30,11 +30,13 @@ namespace NetworkLibrary.Tests
                 connectedPeer = peer;
             };
 
-            server.OnDataReceived = (peer, data) => 
+            server.OnDataReceived = (peer, data, offset, length) =>
             {
                 // Carrega os bytes recebidos em um novo BitBuffer
+                var slice = new byte[length];
+                Array.Copy(data, offset, slice, 0, length);
                 using var reader = new BitBuffer();
-                reader.FromArray(data);
+                reader.FromArray(slice);
 
                 // Valida o que o cliente mandou
                 Assert.Equal(42u, reader.ReadUInt());
@@ -63,10 +65,12 @@ namespace NetworkLibrary.Tests
                 client.Send(writer);
             };
 
-            client.OnDataReceived = (data) =>
+            client.OnDataReceived = (data, offset, length) =>
             {
+                var slice = new byte[length];
+                Array.Copy(data, offset, slice, 0, length);
                 using var reader = new BitBuffer();
-                reader.FromArray(data);
+                reader.FromArray(slice);
                 
                 Assert.Equal("Hello Client!", reader.ReadString());
                 clientReceivedData = true;

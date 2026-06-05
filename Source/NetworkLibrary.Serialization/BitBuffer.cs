@@ -46,7 +46,7 @@ namespace NetworkLibrary.Serialization
         public BitBuffer(int capacity = DefaultCapacity)
         {
             _chunks = ArrayPool<uint>.Shared.Rent(capacity);
-            Array.Clear(_chunks, 0, _chunks.Length);
+            Array.Clear(_chunks, 0, _chunks.Length); // Zeroed to prevent dirty-pool bugs
             _readPosition = 0;
             _writePosition = 0;
         }
@@ -106,6 +106,12 @@ namespace NetworkLibrary.Serialization
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Clear()
         {
+            // Zero out the chunks that were written so reuse doesn't see stale bits
+            if (_chunks != null && _writePosition > 0)
+            {
+                int usedChunks = (_writePosition + 31) >> 5;
+                Array.Clear(_chunks, 0, usedChunks);
+            }
             _readPosition = 0;
             _writePosition = 0;
         }
@@ -445,23 +451,15 @@ namespace NetworkLibrary.Serialization
         public string ReadString()
         {
             int length = (int)ReadRaw(StringLengthBits);
-
-#if NET10_0_OR_GREATER || NET6_0_OR_GREATER
-            return string.Create(length, this, static (span, buffer) =>
-            {
-                for (int i = 0; i < span.Length; i++)
-                {
-                    span[i] = (char)buffer.ReadRaw(BitsASCII);
-                }
-            });
-#else
-            var sb = new StringBuilder(length);
+            // NOTE: Cannot use string.Create(length, this, ...) because BitBuffer is a struct.
+            // Passing 'this' by value to the lambda means _readPosition updates inside the
+            // lambda do NOT propagate back to the caller — causing 'Read past end of buffer'.
+            var chars = new char[length];
             for (int i = 0; i < length; i++)
             {
-                sb.Append((char)ReadRaw(BitsASCII));
+                chars[i] = (char)ReadRaw(BitsASCII);
             }
-            return sb.ToString();
-#endif
+            return new string(chars);
         }
 
         /// <summary>
@@ -635,8 +633,14 @@ namespace NetworkLibrary.Serialization
                 _chunks = ArrayPool<uint>.Shared.Rent(chunkCount);
             }
 
-            MemoryMarshal.Cast<byte, uint>(source).CopyTo(_chunks);
-            Array.Clear(_chunks, chunkCount, _chunks.Length - chunkCount);
+            // Zero chunk array completely first (prevents dirty trailing bits)
+            Array.Clear(_chunks, 0, Math.Min(chunkCount + 1, _chunks.Length));
+            // Copy bytes one-by-one into the uint array as raw bytes
+            source.CopyTo(MemoryMarshal.AsBytes(new Span<uint>(_chunks, 0, chunkCount)));
+
+            // Zero out remainder of the rented array beyond what we used
+            if (_chunks.Length > chunkCount)
+                Array.Clear(_chunks, chunkCount, _chunks.Length - chunkCount);
 
             _readPosition = 0;
             _writePosition = length * 8;
@@ -672,7 +676,11 @@ namespace NetworkLibrary.Serialization
         private void EnsureCapacity(int totalBits)
         {
             int chunkIndex = (totalBits + 31) >> 5;
-            if (_chunks == null) _chunks = ArrayPool<uint>.Shared.Rent(DefaultCapacity);
+            if (_chunks == null)
+            {
+                _chunks = ArrayPool<uint>.Shared.Rent(DefaultCapacity);
+                Array.Clear(_chunks, 0, _chunks.Length);
+            }
 
             int currentCapacity = _chunks.Length;
             if (chunkIndex >= currentCapacity)
@@ -681,7 +689,9 @@ namespace NetworkLibrary.Serialization
                 newCapacity = Math.Max(newCapacity, chunkIndex + 1);
 
                 uint[] newChunks = ArrayPool<uint>.Shared.Rent(newCapacity);
+                // Copy existing data, then zero out the rest to prevent dirty-pool corruption
                 Array.Copy(_chunks, newChunks, currentCapacity);
+                Array.Clear(newChunks, currentCapacity, newChunks.Length - currentCapacity);
                 ArrayPool<uint>.Shared.Return(_chunks);
                 _chunks = newChunks;
             }

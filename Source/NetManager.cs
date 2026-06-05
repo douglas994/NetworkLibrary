@@ -63,7 +63,13 @@ namespace NetworkLibrary
         /// <summary>
         /// Starts the NetManager in Server mode on the specified port.
         /// </summary>
-        public void Start(int port)
+        /// <param name="port">UDP/TCP port to listen on.</param>
+        /// <param name="receiveThreads">
+        /// Number of parallel packet-receive threads (UDP only). 1 = single thread.
+        /// On Linux uses SO_REUSEPORT sockets; on Windows uses multiple threads on one shared socket.
+        /// Recommended for high load: Environment.ProcessorCount / 2.
+        /// </param>
+        public void Start(int port, int receiveThreads = 1)
         {
             if (IsRunning) throw new InvalidOperationException("Manager is already running");
             IsRunning = true;
@@ -71,6 +77,8 @@ namespace NetworkLibrary
             if (_transportType == TransportType.Udp)
             {
                 _udpServer = new NetworkServer();
+                if (receiveThreads > 1)
+                    _udpServer.EnableReusePort(receiveThreads);
 
                 _udpServer.OnPeerConnected = (p) =>
                 {

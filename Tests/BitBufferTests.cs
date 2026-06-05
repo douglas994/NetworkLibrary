@@ -290,10 +290,12 @@ namespace NetworkLibrary.Tests
         {
             using var buffer = new BitBuffer();
 
-            buffer.AddBool(true)
-                  .AddUInt(10, 500)
-                  .AddFloat(1.5f)
-                  .AddString("chain");
+            // Note: BitBuffer is a struct, so fluent chaining via return value doesn't work
+            // (each call returns a copy). Call methods individually instead.
+            buffer.AddBool(true);
+            buffer.AddUInt(10, 500);
+            buffer.AddFloat(1.5f);
+            buffer.AddString("chain");
 
             Assert.True(buffer.ReadBool());
             Assert.Equal(500u, buffer.ReadUInt(10));
@@ -328,7 +330,7 @@ namespace NetworkLibrary.Tests
         [Fact]
         public void HalfPrecision_Extension()
         {
-            using var buffer = new BitBuffer();
+            var buffer = new BitBuffer();
 
             buffer.AddHalf(1.5f);
             buffer.AddHalf(-42.0f);
@@ -337,13 +339,14 @@ namespace NetworkLibrary.Tests
             Assert.Equal(1.5f, buffer.ReadHalf(), 0.01f);
             Assert.Equal(-42.0f, buffer.ReadHalf(), 0.5f);
             Assert.Equal(0f, buffer.ReadHalf(), 0.001f);
+            buffer.Dispose();
         }
 
         [Fact]
         public void BoundedRange_Vector3_Extension()
         {
             var range = new BoundedRange(-500f, 500f, 0.1f);
-            using var buffer = new BitBuffer();
+            var buffer = new BitBuffer();
 
             buffer.AddVector3(range, 123.4f, -200.5f, 88.8f);
             buffer.ReadVector3(range, out float x, out float y, out float z);
@@ -351,12 +354,13 @@ namespace NetworkLibrary.Tests
             Assert.InRange(x, 123.3f, 123.5f);
             Assert.InRange(y, -200.6f, -200.4f);
             Assert.InRange(z, 88.7f, 88.9f);
+            buffer.Dispose();
         }
 
         [Fact]
         public void SmallestThree_Quaternion_Extension()
         {
-            using var buffer = new BitBuffer();
+            var buffer = new BitBuffer();
 
             // Normalized quaternion
             float len = MathF.Sqrt(0.1f * 0.1f + 0.2f * 0.2f + 0.3f * 0.3f + 0.927f * 0.927f);
@@ -370,12 +374,13 @@ namespace NetworkLibrary.Tests
             Assert.InRange(ry, qy - 0.01f, qy + 0.01f);
             Assert.InRange(rz, qz - 0.01f, qz + 0.01f);
             Assert.InRange(rw, qw - 0.01f, qw + 0.01f);
+            buffer.Dispose();
         }
 
         [Fact]
         public void Angle_NormalizedValue_Extensions()
         {
-            using var buffer = new BitBuffer();
+            var buffer = new BitBuffer();
 
             buffer.AddAngle(10, 180f);
             buffer.AddNormalized(8, 0.75f);
@@ -385,6 +390,7 @@ namespace NetworkLibrary.Tests
 
             Assert.InRange(angle, 179f, 181f);
             Assert.InRange(normalized, 0.74f, 0.76f);
+            buffer.Dispose();
         }
     }
 }
