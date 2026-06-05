@@ -65,14 +65,19 @@ namespace NetworkLibrary
         /// </summary>
         /// <param name="port">UDP/TCP port to listen on.</param>
         /// <param name="receiveThreads">
-        /// Number of parallel packet-receive threads (UDP only). 1 = single thread.
-        /// On Linux uses SO_REUSEPORT sockets; on Windows uses multiple threads on one shared socket.
-        /// Recommended for high load: Environment.ProcessorCount / 2.
+        /// Number of parallel packet-receive threads (UDP only).
+        /// If 0 (default), it automatically detects the OS and uses Environment.ProcessorCount / 2 on Linux for SO_REUSEPORT, or 1 on Windows.
         /// </param>
-        public void Start(int port, int receiveThreads = 1)
+        public void Start(int port, int receiveThreads = 0)
         {
             if (IsRunning) throw new InvalidOperationException("Manager is already running");
             IsRunning = true;
+
+            // Auto-detect optimal thread count for the current OS
+            if (receiveThreads <= 0)
+            {
+                receiveThreads = OperatingSystem.IsLinux() ? Math.Max(1, Environment.ProcessorCount / 2) : 1;
+            }
 
             if (_transportType == TransportType.Udp)
             {
