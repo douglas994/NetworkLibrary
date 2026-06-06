@@ -241,18 +241,38 @@ namespace NetworkLibrary.Transport
         /// </summary>
         public bool ProcessReceive(ushort sequence, byte[] data, int offset, int length, bool storeData = false)
         {
-            // Update remote sequence
-            if (PacketHeader.IsSequenceNewer(sequence, _remoteSequence))
+            // For ordered channels, any sequence older than the next expected one was already delivered.
+            if (storeData && sequence != _nextOrderedSequence && PacketHeader.IsSequenceNewer(_nextOrderedSequence, sequence))
             {
-                _remoteSequence = sequence;
+                return false;
+            }
+
+            // For all channels, drop packets that fall way outside the current receive window
+            if (sequence != _remoteSequence && PacketHeader.IsSequenceNewer(_remoteSequence, sequence))
+            {
+                int distance = PacketHeader.SequenceDistance(sequence, _remoteSequence);
+                if (distance >= WindowSize)
+                    return false; // Too old, out of window
             }
 
             int index = sequence & WindowMask;
             ref PendingPacket slot = ref _receiveBuffer[index];
 
-            // Duplicate check
-            if (slot.Active && slot.Sequence == sequence)
-                return false;
+            // If the slot is active and holds a newer or equal sequence, this packet is a duplicate or too old to overwrite
+            if (slot.Active)
+            {
+                if (slot.Sequence == sequence) 
+                    return false;
+                
+                if (PacketHeader.IsSequenceNewer(slot.Sequence, sequence))
+                    return false;
+            }
+
+            // Update remote sequence
+            if (PacketHeader.IsSequenceNewer(sequence, _remoteSequence))
+            {
+                _remoteSequence = sequence;
+            }
 
             // Store the packet data only if requested
             if (storeData)
