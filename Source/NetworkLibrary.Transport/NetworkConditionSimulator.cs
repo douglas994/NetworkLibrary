@@ -12,6 +12,7 @@ namespace NetworkLibrary.Transport
         public int LatencyMs { get; set; } = 0;
         public int JitterMs { get; set; } = 0;
         public float PacketLossPercent { get; set; } = 0f;
+        public float DuplicatePercent { get; set; } = 0f;
 
         private class DelayedPacket
         {
@@ -27,10 +28,20 @@ namespace NetworkLibrary.Transport
 
         public void Send(Socket socket, byte[] data, int offset, int length, EndPoint endPoint)
         {
-            if (!Enabled || (LatencyMs == 0 && PacketLossPercent == 0f))
+            if (!Enabled || (LatencyMs == 0 && PacketLossPercent == 0f && DuplicatePercent == 0f))
             {
                 socket.SendTo(data, offset, length, SocketFlags.None, endPoint);
                 return;
+            }
+
+            // Packet Duplication
+            if (DuplicatePercent > 0f)
+            {
+                if (_random.NextDouble() * 100.0 < DuplicatePercent)
+                {
+                    // Fire a duplicate packet immediately
+                    socket.SendTo(data, offset, length, SocketFlags.None, endPoint);
+                }
             }
 
             // Packet Loss

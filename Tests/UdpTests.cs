@@ -244,5 +244,62 @@ namespace NetworkLibrary.Tests
 
             Assert.True(testPassed, $"Com 10% de perda, recebeu apenas {expectedSequence}/{totalMessages} (retransmissão falhou).");
         }
+        [Fact]
+        public async Task Udp_ReliableOrdered_FiltersDuplicates()
+        {
+            int testPort = 14005;
+            var serverListener = new EventBasedNetListener();
+            var clientListener = new EventBasedNetListener();
+
+            using var server = new NetManager(serverListener, TransportType.Udp);
+            using var client = new NetManager(clientListener, TransportType.Udp);
+
+            const int totalMessages = 30;
+            int expectedSequence = 0;
+            bool testPassed = false;
+            bool duplicateDetected = false;
+
+            serverListener.NetworkReceiveEvent += (peer, reader, method) =>
+            {
+                int receivedSeq = reader.ReadInt();
+                if (receivedSeq != expectedSequence)
+                {
+                    duplicateDetected = true; // This should never happen if filtering works
+                }
+                Assert.Equal(expectedSequence, receivedSeq);
+                expectedSequence++;
+                if (expectedSequence == totalMessages)
+                    testPassed = true;
+            };
+
+            server.Start(testPort);
+
+            clientListener.PeerConnectedEvent += (peer) =>
+            {
+                for (int i = 0; i < totalMessages; i++)
+                {
+                    using var writer = new BitBuffer();
+                    writer.AddInt(i);
+                    peer.Send(writer, DeliveryMethod.ReliableOrdered);
+                }
+            };
+
+            client.Connect("127.0.0.1", testPort);
+
+            // 50% packet duplication (high probability of testing the duplicate filter)
+            client.Simulator!.Enabled = true;
+            client.Simulator.DuplicatePercent = 50f;
+
+            var deadline = System.Diagnostics.Stopwatch.StartNew();
+            while (deadline.Elapsed.TotalSeconds < 5 && !testPassed)
+            {
+                server.PollEvents();
+                client.PollEvents();
+                await Task.Delay(5);
+            }
+
+            Assert.False(duplicateDetected, "Recebeu mensagens duplicadas ou fora de ordem!");
+            Assert.True(testPassed, $"Recebeu apenas {expectedSequence}/{totalMessages}.");
+        }
     }
 }
