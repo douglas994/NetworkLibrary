@@ -301,5 +301,116 @@ namespace NetworkLibrary.Tests
             Assert.False(duplicateDetected, "Recebeu mensagens duplicadas ou fora de ordem!");
             Assert.True(testPassed, $"Recebeu apenas {expectedSequence}/{totalMessages}.");
         }
+        [Fact]
+        public async Task Udp_Reliable_FiltersDuplicates()
+        {
+            int testPort = 14006;
+            var serverListener = new EventBasedNetListener();
+            var clientListener = new EventBasedNetListener();
+
+            using var server = new NetManager(serverListener, TransportType.Udp);
+            using var client = new NetManager(clientListener, TransportType.Udp);
+
+            const int totalMessages = 30;
+            var receivedMessages = new System.Collections.Generic.HashSet<int>();
+            bool duplicateDetected = false;
+
+            serverListener.NetworkReceiveEvent += (peer, reader, method) =>
+            {
+                int val = reader.ReadInt();
+                if (!receivedMessages.Add(val))
+                {
+                    duplicateDetected = true;
+                }
+            };
+
+            server.Start(testPort);
+
+            clientListener.PeerConnectedEvent += (peer) =>
+            {
+                for (int i = 0; i < totalMessages; i++)
+                {
+                    using var writer = new BitBuffer();
+                    writer.AddInt(i);
+                    peer.Send(writer, DeliveryMethod.Reliable);
+                }
+            };
+
+            client.Connect("127.0.0.1", testPort);
+
+            client.Simulator!.Enabled = true;
+            client.Simulator.DuplicatePercent = 50f;
+
+            var deadline = System.Diagnostics.Stopwatch.StartNew();
+            while (deadline.Elapsed.TotalSeconds < 5 && receivedMessages.Count < totalMessages)
+            {
+                server.PollEvents();
+                client.PollEvents();
+                await Task.Delay(5);
+            }
+
+            Assert.False(duplicateDetected, "Recebeu mensagens duplicadas no Reliable!");
+            Assert.Equal(totalMessages, receivedMessages.Count);
+        }
+
+        [Fact]
+        public async Task Udp_ChaosMonkey_ExtremeNetworkConditions()
+        {
+            int testPort = 14007;
+            var serverListener = new EventBasedNetListener();
+            var clientListener = new EventBasedNetListener();
+
+            using var server = new NetManager(serverListener, TransportType.Udp);
+            using var client = new NetManager(clientListener, TransportType.Udp);
+
+            const int totalMessages = 50;
+            int expectedSequence = 0;
+            bool testPassed = false;
+
+            serverListener.NetworkReceiveEvent += (peer, reader, method) =>
+            {
+                int receivedSeq = reader.ReadInt();
+                Assert.Equal(expectedSequence, receivedSeq); // Must be strictly ordered
+                expectedSequence++;
+                if (expectedSequence == totalMessages)
+                    testPassed = true;
+            };
+
+            server.Start(testPort);
+
+            clientListener.PeerConnectedEvent += (peer) =>
+            {
+                for (int i = 0; i < totalMessages; i++)
+                {
+                    using var writer = new BitBuffer();
+                    writer.AddInt(i);
+                    peer.Send(writer, DeliveryMethod.ReliableOrdered);
+                }
+            };
+
+            client.Connect("127.0.0.1", testPort);
+
+            // Caos total: perda, latência variável E duplicação de pacotes!
+            client.Simulator!.Enabled = true;
+            client.Simulator.PacketLossPercent = 15f;
+            client.Simulator.LatencyMs = 50;
+            client.Simulator.JitterMs = 20;
+            client.Simulator.DuplicatePercent = 25f;
+
+            server.Simulator!.Enabled = true;
+            server.Simulator.PacketLossPercent = 15f;
+            server.Simulator.LatencyMs = 50;
+            server.Simulator.JitterMs = 20;
+
+            var deadline = System.Diagnostics.Stopwatch.StartNew();
+            while (deadline.Elapsed.TotalSeconds < 25 && !testPassed)
+            {
+                server.PollEvents();
+                client.PollEvents();
+                await Task.Delay(10);
+            }
+
+            Assert.True(testPassed, $"Chaos monkey failed! Recebeu apenas {expectedSequence}/{totalMessages}");
+        }
     }
 }
