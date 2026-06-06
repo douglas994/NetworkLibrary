@@ -591,7 +591,7 @@ namespace NetworkLibrary.Serialization
             FromArray(source, source.Length);
         }
 
-#if NET10_0_OR_GREATER || NET6_0_OR_GREATER
+
         /// <summary>
         /// Writes the buffer contents into a Span (zero-copy friendly).
         /// </summary>
@@ -645,7 +645,7 @@ namespace NetworkLibrary.Serialization
             _readPosition = 0;
             _writePosition = length * 8;
         }
-#endif
+
 
         // ═══════════════════════════════════════════════════════
         //  UTILITIES

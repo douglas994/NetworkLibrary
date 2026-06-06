@@ -20,8 +20,7 @@ namespace NetworkLibrary.Packets
             _handlers[packetId] = (NetPeer peer, ref BitBuffer buffer) =>
             {
                 T packet = new T();
-                var reader = new PacketReader(ref buffer);
-                packet.Deserialize(ref reader);
+                packet.Deserialize(ref buffer);
                 handler(peer, packet);
             };
         }

@@ -14,7 +14,17 @@
       "Bash(git checkout *)",
       "Bash(timeout 22 dotnet StressTest/bin/Release/net10.0/StressTest.dll)",
       "Bash(timeout 25 dotnet StressTest/bin/Release/net10.0/StressTest.dll)",
-      "Bash(DOTNET_gcServer=0 DOTNET_gcConcurrent=1 timeout 22 dotnet StressTest/bin/Release/net10.0/StressTest.dll)"
+      "Bash(DOTNET_gcServer=0 DOTNET_gcConcurrent=1 timeout 22 dotnet StressTest/bin/Release/net10.0/StressTest.dll)",
+      "Bash(git add *)",
+      "Bash(git commit -m '@ *)",
+      "Bash(git commit --amend -m 'Cap auto receive-thread count and make NetManager.Start failure-safe' -m '- Auto receive-thread count is now clamped to [1,4] on Linux. Receive scales sub-linearly \\(one thread already handles ~600k pkt/s\\), so this leaves the remaining cores for the game simulation instead of oversubscribing on networking. *)",
+      "Bash(git push *)",
+      "Bash(git commit -m 'Add connection handshake security, IPv6 support, and hardening tests' -m '- Handshake: NetworkServer/Client/NetManager gain ConnectionKey \\(token\\) and ProtocolVersion. The server now only accepts a peer whose ConnectRequest carries a matching version + token; any other packet from an unknown address is dropped, blocking spoofed/garbage/incompatible connects. Defaults \\(key=0, version=1\\) keep existing behavior. *)",
+      "Bash(NL_MEASURE_PEERS=1 dotnet StressTest/bin/Release/net10.0/StressTest.dll)",
+      "Bash(DOTNET_gcServer=0 NL_MEASURE_PEERS=1 dotnet StressTest/bin/Release/net10.0/StressTest.dll)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\UsuarioPC\\ArcaneMMO"
     ]
   }
 }

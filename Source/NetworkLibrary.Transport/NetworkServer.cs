@@ -8,6 +8,7 @@
  */
 
 using System;
+using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -140,7 +141,7 @@ namespace NetworkLibrary.Transport
 
             _reusePortWorkers = Math.Max(1, workerCount);
 
-            if (OperatingSystem.IsLinux())
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
                 Console.WriteLine($"[NetworkServer] SO_REUSEPORT enabled: {_reusePortWorkers} load-balanced sockets.");
             else
                 Console.WriteLine($"[NetworkServer] Multi-threaded receive: {_reusePortWorkers} threads on 1 shared socket.");
@@ -158,7 +159,7 @@ namespace NetworkLibrary.Transport
 
             // Linux: one SO_REUSEPORT socket per thread (kernel load-balances).
             // Windows: one shared socket, multiple threads calling ReceiveFrom on it.
-            bool useReusePort = OperatingSystem.IsLinux() && workerCount > 1;
+            bool useReusePort = RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && workerCount > 1;
             int socketCount = useReusePort ? workerCount : 1;
 
             _sockets = new Socket[socketCount];
@@ -414,15 +415,23 @@ namespace NetworkLibrary.Transport
             var socket = _sockets![workerIndex];
             // Each thread has its own private buffer — no sharing, no locking on receive
             byte[] receiveBuffer = new byte[PacketHeader.SafeMTU];
-            // Match the socket's family so ReceiveFrom can write the sender address (IPv4 or IPv6/DualMode).
+            // Match the socket's family so ReceiveFrom can write the sender address.
+#if NETSTANDARD2_1
+            EndPoint remoteSA = new IPEndPoint(socket.AddressFamily == AddressFamily.InterNetworkV6 ? System.Net.IPAddress.IPv6Any : System.Net.IPAddress.Any, 0);
+#else
             SocketAddress remoteSA = new SocketAddress(socket.AddressFamily);
+#endif
 
             while (_isRunning)
             {
                 int received;
                 try
                 {
+#if NETSTANDARD2_1
+                    received = socket.ReceiveFrom(receiveBuffer, 0, receiveBuffer.Length, SocketFlags.None, ref remoteSA);
+#else
                     received = socket.ReceiveFrom(receiveBuffer.AsSpan(), SocketFlags.None, remoteSA);
+#endif
                 }
                 catch (SocketException)
                 {
@@ -443,7 +452,11 @@ namespace NetworkLibrary.Transport
                 {
                     Buffer = dataCopy,
                     Length = received,
+#if NETSTANDARD2_1
+                    Sender = new PeerAddress((IPEndPoint)remoteSA)
+#else
                     Sender = new PeerAddress(remoteSA)
+#endif
                 });
             }
         }
@@ -835,6 +848,31 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
             peer.LastSendTime = Stopwatch.GetTimestamp();
         }
 
+#if NETSTANDARD2_1
+        private void SendRawTo(NetworkPeer peer, ReadOnlySpan<byte> data)
+        {
+            try
+            {
+                byte[] tmp = _bufferPool.Rent(data.Length);
+                data.CopyTo(tmp);
+
+                if (Simulator.Enabled)
+                {
+                    Simulator.Send(_sockets![0], tmp, 0, data.Length, peer.RemoteEndPoint);
+                }
+                else
+                {
+                    _sockets![0].SendTo(tmp, 0, data.Length, SocketFlags.None, peer.RemoteEndPoint);
+                }
+
+                _bufferPool.Return(tmp);
+            }
+            catch (SocketException)
+            {
+                // Swallow send errors (peer may have disconnected)
+            }
+        }
+#else
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SendRawTo(NetworkPeer peer, ReadOnlySpan<byte> data)
         {
@@ -862,6 +900,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                 // Swallow send errors (peer may have disconnected)
             }
         }
+#endif
 
         private void RaiseDataReceived(NetworkPeer peer, byte[] data, int offset, int length, DeliveryMethod delivery)
         {

@@ -56,7 +56,6 @@ namespace NetworkLibrary.Transport
 
         // ── Sequencing ──
         private ushort _unreliableLocalSequence;
-        private int _unreliableRemoteSequence;
 
         // ── Simulation (Chaos Monkey) ──
         public NetworkConditionSimulator Simulator { get; } = new NetworkConditionSimulator();
@@ -274,15 +273,22 @@ namespace NetworkLibrary.Transport
 
         private void ReceiveLoop()
         {
-            // Match the socket's family (IPv4 or IPv6) so ReceiveFrom can write the sender address.
+#if NETSTANDARD2_1
+            EndPoint remoteSA = new IPEndPoint(_socket!.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0);
+#else
             SocketAddress remoteSA = new SocketAddress(_socket!.AddressFamily);
+#endif
 
             while (_isRunning && _socket != null)
             {
                 int received;
                 try
                 {
+#if NETSTANDARD2_1
+                    received = _socket.ReceiveFrom(_receiveBuffer, 0, _receiveBuffer.Length, SocketFlags.None, ref remoteSA);
+#else
                     received = _socket.ReceiveFrom(_receiveBuffer.AsSpan(), SocketFlags.None, remoteSA);
+#endif
                 }
                 catch (SocketException)
                 {
@@ -636,7 +642,6 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
             _reliableChannel.Reset();
             _reliableOrderedChannel.Reset();
             _unreliableLocalSequence = 0;
-            _unreliableRemoteSequence = 0;
             _sequencedLocalSequence = 0;
             _sequencedRemoteSequence = 0;
 

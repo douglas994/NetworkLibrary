@@ -37,6 +37,13 @@ namespace StressTest
 
         static void Main(string[] args)
         {
+            // Memory measurement mode: NL_MEASURE_PEERS=1 — isolates the per-peer server-side cost.
+            if (Environment.GetEnvironmentVariable("NL_MEASURE_PEERS") == "1")
+            {
+                MeasurePeerMemory();
+                return;
+            }
+
             Console.WriteLine("=====================================");
             Console.WriteLine($"   MMORPG STRESS TEST ({Protocol})   ");
             Console.WriteLine("=====================================");
@@ -79,6 +86,49 @@ namespace StressTest
                 }
 
                 Thread.Sleep(1); // Small sleep to prevent 100% CPU lock
+            }
+        }
+
+        static void MeasurePeerMemory()
+        {
+            Console.WriteLine("=== PER-PEER MEMORY MEASUREMENT (server-side NetworkPeer) ===");
+
+            // Warm up: force JIT/type init so it doesn't pollute the measurement.
+            var warm = new NetworkLibrary.Transport.NetworkPeer();
+            GC.KeepAlive(warm);
+
+            // GetAllocatedBytesForCurrentThread counts allocation bytes EXACTLY (not quantized by
+            // GC heap segments like GetTotalMemory), so per-peer cost is precise.
+            foreach (int n in new[] { 1000, 5000, 10000 })
+            {
+                long before = GC.GetAllocatedBytesForCurrentThread();
+
+                var peers = new NetworkLibrary.Transport.NetworkPeer[n];
+                for (int i = 0; i < n; i++)
+                    peers[i] = new NetworkLibrary.Transport.NetworkPeer();
+
+                long after = GC.GetAllocatedBytesForCurrentThread();
+                GC.KeepAlive(peers);
+
+                long total = after - before;
+                Console.WriteLine($"{n,6} peers: {total / 1024.0 / 1024.0,7:F2} MB total  |  {(double)total / n,7:F0} bytes/peer");
+            }
+            Console.WriteLine("=== (idle/baseline cost — on-demand reliable Data buffers are pooled separately) ===");
+
+            // Now measure a full NetworkClient object (what the StressTest co-locates 2000 of).
+            var warmC = new NetworkLibrary.Transport.NetworkClient();
+            GC.KeepAlive(warmC);
+            Console.WriteLine("\n=== PER-CLIENT MEMORY (object only — does NOT include the OS thread each Connect() spawns) ===");
+            foreach (int n in new[] { 1000, 2000 })
+            {
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                var clients = new NetworkLibrary.Transport.NetworkClient[n];
+                for (int i = 0; i < n; i++)
+                    clients[i] = new NetworkLibrary.Transport.NetworkClient();
+                long after = GC.GetAllocatedBytesForCurrentThread();
+                GC.KeepAlive(clients);
+                long total = after - before;
+                Console.WriteLine($"{n,6} clients: {total / 1024.0 / 1024.0,7:F2} MB total  |  {(double)total / n,7:F0} bytes/client");
             }
         }
 

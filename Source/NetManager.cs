@@ -7,6 +7,7 @@
  */
 
 using System;
+using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using NetworkLibrary.Packets;
 using NetworkLibrary.Serialization;
@@ -89,7 +90,7 @@ namespace NetworkLibrary
             // so we leave the rest of the cores for the game simulation.
             if (receiveThreads <= 0)
             {
-                receiveThreads = OperatingSystem.IsLinux()
+                receiveThreads = RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
                     ? Math.Clamp(Environment.ProcessorCount / 2, 1, 4)
                     : 1;
             }

@@ -65,8 +65,7 @@ namespace NetworkLibrary
             BitBuffer buffer = new BitBuffer();
             try
             {
-                var writer = new PacketWriter(ref buffer);
-                packet.Serialize(ref writer);
+                packet.Serialize(ref buffer);
                 Send(buffer, deliveryMethod);
             }
             finally
@@ -84,8 +83,7 @@ namespace NetworkLibrary
             try
             {
                 buffer.AddByte(packetId);
-                var writer = new PacketWriter(ref buffer);
-                packet.Serialize(ref writer);
+                packet.Serialize(ref buffer);
                 Send(buffer, deliveryMethod);
             }
             finally

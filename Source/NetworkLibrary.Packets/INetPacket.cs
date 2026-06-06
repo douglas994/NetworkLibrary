@@ -1,3 +1,5 @@
+using NetworkLibrary.Serialization;
+
 namespace NetworkLibrary.Packets
 {
     /// <summary>
@@ -6,7 +8,7 @@ namespace NetworkLibrary.Packets
     /// </summary>
     public interface INetPacket
     {
-        void Serialize(ref PacketWriter writer);
-        void Deserialize(ref PacketReader reader);
+        void Serialize(ref BitBuffer writer);
+        void Deserialize(ref BitBuffer reader);
     }
 }
