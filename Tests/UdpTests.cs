@@ -131,5 +131,118 @@ namespace NetworkLibrary.Tests
 
             Assert.True(testPassed, $"Falhou no stress test. Recebeu apenas {expectedSequence} de {totalMessages} mensagens ordenadas.");
         }
+
+        [Fact]
+        public async Task Udp_Handshake_RejectsWrongConnectionKey()
+        {
+            int testPort = 14002;
+            using var server = new NetManager(new EventBasedNetListener(), TransportType.Udp) { ConnectionKey = 0xABCDEF01 };
+
+            var clientListener = new EventBasedNetListener();
+            using var client = new NetManager(clientListener, TransportType.Udp) { ConnectionKey = 0xDEADBEEF }; // wrong token
+
+            bool clientConnected = false;
+            clientListener.PeerConnectedEvent += (peer) => clientConnected = true;
+
+            server.Start(testPort);
+            client.Connect("127.0.0.1", testPort);
+
+            // Give it plenty of frames; a rejected client should NEVER connect.
+            int frames = 120;
+            while (frames-- > 0 && !clientConnected)
+            {
+                server.PollEvents();
+                client.PollEvents();
+                await Task.Delay(16);
+            }
+
+            Assert.False(clientConnected, "Cliente com token errado NÃO deveria ter conectado.");
+        }
+
+        [Fact]
+        public async Task Udp_Handshake_AcceptsMatchingConnectionKey()
+        {
+            int testPort = 14003;
+            using var server = new NetManager(new EventBasedNetListener(), TransportType.Udp) { ConnectionKey = 0xABCDEF01 };
+
+            var clientListener = new EventBasedNetListener();
+            using var client = new NetManager(clientListener, TransportType.Udp) { ConnectionKey = 0xABCDEF01 }; // matching token
+
+            bool clientConnected = false;
+            clientListener.PeerConnectedEvent += (peer) => clientConnected = true;
+
+            server.Start(testPort);
+            client.Connect("127.0.0.1", testPort);
+
+            int frames = 120;
+            while (frames-- > 0 && !clientConnected)
+            {
+                server.PollEvents();
+                client.PollEvents();
+                await Task.Delay(16);
+            }
+
+            Assert.True(clientConnected, "Cliente com token correto deveria ter conectado.");
+        }
+
+        [Fact]
+        public async Task Udp_ReliableOrdered_SurvivesPacketLoss()
+        {
+            int testPort = 14004;
+            var serverListener = new EventBasedNetListener();
+            var clientListener = new EventBasedNetListener();
+
+            using var server = new NetManager(serverListener, TransportType.Udp);
+            using var client = new NetManager(clientListener, TransportType.Udp);
+
+            const int totalMessages = 30;
+            int expectedSequence = 0;
+            bool testPassed = false;
+
+            serverListener.NetworkReceiveEvent += (peer, reader, method) =>
+            {
+                int receivedSeq = reader.ReadInt();
+                // ReliableOrdered must still arrive in order despite the lossy link.
+                Assert.Equal(expectedSequence, receivedSeq);
+                expectedSequence++;
+                if (expectedSequence == totalMessages)
+                    testPassed = true;
+            };
+
+            server.Start(testPort);
+
+            clientListener.PeerConnectedEvent += (peer) =>
+            {
+                for (int i = 0; i < totalMessages; i++)
+                {
+                    using var writer = new BitBuffer();
+                    writer.AddInt(i);
+                    peer.Send(writer, DeliveryMethod.ReliableOrdered);
+                }
+            };
+
+            client.Connect("127.0.0.1", testPort);
+
+            // Drop 10% of packets on BOTH directions (data AND acks) — a realistic "bad network"
+            // that exercises retransmission. (Much higher bidirectional loss can exceed
+            // MaxRetransmits and permanently stall ordered delivery — see ReliableChannel.)
+            // Set after Connect/Start so the backends (and their simulators) exist.
+            server.Simulator!.Enabled = true;
+            server.Simulator.PacketLossPercent = 10f;
+            client.Simulator!.Enabled = true;
+            client.Simulator.PacketLossPercent = 10f;
+
+            // Use a REAL-TIME deadline (not a frame count): retransmission is RTO/wall-clock based,
+            // so polling must run long enough in real time regardless of scheduler slippage.
+            var deadline = System.Diagnostics.Stopwatch.StartNew();
+            while (deadline.Elapsed.TotalSeconds < 20 && !testPassed)
+            {
+                server.PollEvents();
+                client.PollEvents();
+                await Task.Delay(5);
+            }
+
+            Assert.True(testPassed, $"Com 10% de perda, recebeu apenas {expectedSequence}/{totalMessages} (retransmissão falhou).");
+        }
     }
 }

@@ -95,6 +95,18 @@ namespace NetworkLibrary.Transport
         public float RTT => _reliableChannel.RTT;
 
         /// <summary>
+        /// Application connection token. Must match the server's <see cref="NetworkServer.ConnectionKey"/>
+        /// or the connection is rejected. Set before calling <see cref="Connect"/>. 0 = no token.
+        /// </summary>
+        public uint ConnectionKey { get; set; } = 0;
+
+        /// <summary>
+        /// Wire protocol version. Must match the server's <see cref="NetworkServer.ProtocolVersion"/>.
+        /// Bump it whenever the packet format changes so old clients are rejected. Set before <see cref="Connect"/>.
+        /// </summary>
+        public ushort ProtocolVersion { get; set; } = 1;
+
+        /// <summary>
         /// Creates a new NetworkClient.
         /// </summary>
         public NetworkClient(int connectionTimeoutMs = 15000, int maxConnectAttempts = 10, int pingIntervalMs = 1000)
@@ -262,7 +274,8 @@ namespace NetworkLibrary.Transport
 
         private void ReceiveLoop()
         {
-            SocketAddress remoteSA = new SocketAddress(AddressFamily.InterNetwork);
+            // Match the socket's family (IPv4 or IPv6) so ReceiveFrom can write the sender address.
+            SocketAddress remoteSA = new SocketAddress(_socket!.AddressFamily);
 
             while (_isRunning && _socket != null)
             {
@@ -484,7 +497,28 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
 
         private void SendConnectRequest()
         {
-            SendInternalPacket(InternalPacketType.ConnectRequest);
+            // ConnectRequest carries the handshake payload: [type][protocolVersion u16][connectionKey u32].
+            // The server validates these before accepting the peer, rejecting spoof/garbage/incompatible clients.
+            lock (_sendLock)
+            {
+                const int payloadLen = 1 + 2 + 4;
+                byte[] buf = _bufferPool.Rent(PacketHeader.SafeMTU);
+                int p = PacketHeader.HeaderSize;
+
+                buf[p]     = (byte)InternalPacketType.ConnectRequest;
+                buf[p + 1] = (byte)(ProtocolVersion & 0xFF);
+                buf[p + 2] = (byte)(ProtocolVersion >> 8);
+                buf[p + 3] = (byte)(ConnectionKey & 0xFF);
+                buf[p + 4] = (byte)((ConnectionKey >> 8) & 0xFF);
+                buf[p + 5] = (byte)((ConnectionKey >> 16) & 0xFF);
+                buf[p + 6] = (byte)((ConnectionKey >> 24) & 0xFF);
+
+                _reliableChannel.GenerateAckData(out var ack, out var ackBits);
+                PacketHeader.Write(buf, DeliveryMethod.Internal, 0, ack, ackBits, payloadLen);
+
+                SendRawTo(buf, PacketHeader.HeaderSize + payloadLen);
+                _bufferPool.Return(buf);
+            }
         }
 
         private void SendInternalPacket(InternalPacketType type)

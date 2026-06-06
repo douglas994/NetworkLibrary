@@ -39,6 +39,18 @@ namespace NetworkLibrary
 
         public PacketDispatcher Packets { get; } = new PacketDispatcher();
 
+        /// <summary>
+        /// Application connection token (UDP). Set the SAME value on client and server; a mismatch
+        /// rejects the connection. 0 = no token. Set before Start/Connect. Blocks spoofed/garbage connects.
+        /// </summary>
+        public uint ConnectionKey { get; set; } = 0;
+
+        /// <summary>
+        /// Wire protocol version (UDP). Must match between client and server. Bump on packet-format changes.
+        /// Set before Start/Connect.
+        /// </summary>
+        public ushort ProtocolVersion { get; set; } = 1;
+
         [ThreadStatic]
         private static BitBuffer _receiveBuffer;
 
@@ -88,6 +100,8 @@ namespace NetworkLibrary
             if (_transportType == TransportType.Udp)
             {
                 _udpServer = new NetworkServer();
+                _udpServer.ConnectionKey = ConnectionKey;
+                _udpServer.ProtocolVersion = ProtocolVersion;
                 if (receiveThreads > 1)
                     _udpServer.EnableReusePort(receiveThreads);
 
@@ -194,6 +208,8 @@ namespace NetworkLibrary
             if (_transportType == TransportType.Udp)
             {
                 _udpClient = new NetworkClient();
+                _udpClient.ConnectionKey = ConnectionKey;
+                _udpClient.ProtocolVersion = ProtocolVersion;
 
                 _udpClient.OnConnected = () =>
                 {

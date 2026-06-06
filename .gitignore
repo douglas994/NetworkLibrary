@@ -18,3 +18,7 @@
 # Check script
 check.cs
 check.exe
+
+# Test artifacts
+Tests/TestResults/
+*.trx

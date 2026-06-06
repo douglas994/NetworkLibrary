@@ -17,6 +17,14 @@ namespace NetworkLibrary
     /// Represents a network connection (Client or Server).
     /// Agnostic to the underlying transport (UDP or TCP).
     /// </summary>
+    /// <remarks>
+    /// THREAD SAFETY: Sending to a single peer is NOT thread-safe — the per-peer reliable
+    /// channel (sequence numbers, send window) has no internal lock by design (for performance).
+    /// Send to any given peer from ONE thread at a time. The normal game pattern is safe:
+    /// send from your fixed tick loop, or fan out one thread per peer (different peers in
+    /// parallel is fine; the SAME peer from multiple threads concurrently is not).
+    /// Sends to DIFFERENT peers from different threads are safe.
+    /// </remarks>
     public sealed class NetPeer
     {
         /// <summary>Unique ID assigned to this peer (0 if this is a client endpoint).</summary>

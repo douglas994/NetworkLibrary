@@ -280,6 +280,11 @@ namespace NetworkLibrary.Transport
         /// <summary>
         /// Sends data to a specific peer.
         /// </summary>
+        /// <remarks>
+        /// NOT thread-safe per peer: do not call Send for the SAME peer from multiple threads
+        /// concurrently (the reliable channel's sequence/window is unlocked by design). Sending to
+        /// DIFFERENT peers in parallel is safe. See <see cref="NetworkLibrary.NetPeer"/> remarks.
+        /// </remarks>
         /// <param name="peer">Target peer.</param>
         /// <param name="data">Data to send.</param>
         /// <param name="offset">Offset in data array.</param>
@@ -374,6 +379,21 @@ namespace NetworkLibrary.Transport
         /// <summary>
         /// Gets the number of currently connected peers.
         /// </summary>
+        // ── Handshake / security ──
+
+        /// <summary>
+        /// Application connection token. A client's <see cref="NetworkClient.ConnectionKey"/> must match
+        /// this exact value or its connection is rejected. 0 = no token (open). Set a non-zero secret
+        /// shared with your client to block spoofed/garbage connections from random scanners.
+        /// </summary>
+        public uint ConnectionKey { get; set; } = 0;
+
+        /// <summary>
+        /// Wire protocol version. A client's <see cref="NetworkClient.ProtocolVersion"/> must match or it
+        /// is rejected. Bump it when the packet format changes so outdated clients can't connect.
+        /// </summary>
+        public ushort ProtocolVersion { get; set; } = 1;
+
         // ── Fragmentation ──
         public int MtuSize { get; set; } = PacketHeader.SafeMTU;
 
@@ -394,7 +414,8 @@ namespace NetworkLibrary.Transport
             var socket = _sockets![workerIndex];
             // Each thread has its own private buffer — no sharing, no locking on receive
             byte[] receiveBuffer = new byte[PacketHeader.SafeMTU];
-            SocketAddress remoteSA = new SocketAddress(AddressFamily.InterNetwork);
+            // Match the socket's family so ReceiveFrom can write the sender address (IPv4 or IPv6/DualMode).
+            SocketAddress remoteSA = new SocketAddress(socket.AddressFamily);
 
             while (_isRunning)
             {
@@ -445,8 +466,10 @@ namespace NetworkLibrary.Transport
                 // Find or create peer
                 if (!_peersByEndPoint.TryGetValue(peerAddr, out var peer))
                 {
-                    // New connection request
-                    if (delivery == DeliveryMethod.Internal)
+                    // New connection request — only accept a valid ConnectRequest (right protocol
+                    // version + connection token). Everything else from an unknown peer is dropped,
+                    // so spoofed/garbage/incompatible packets never create a peer.
+                    if (delivery == DeliveryMethod.Internal && IsValidConnectRequest(data, received, dataLength))
                     {
                         peer = AcceptConnection(peerAddr);
                         if (peer == null)
@@ -621,6 +644,28 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                 RemovePeer(peer);
             }
             _peersToRemove.Clear(); // Reuse for next tick
+        }
+
+        /// <summary>
+        /// Validates a handshake packet from an unknown peer: it must be a ConnectRequest carrying
+        /// a matching protocol version and connection token. Rejects everything else.
+        /// Payload layout (after the 12-byte header): [type:1][protocolVersion:2][connectionKey:4].
+        /// </summary>
+        private bool IsValidConnectRequest(byte[] data, int received, int dataLength)
+        {
+            int p = PacketHeader.HeaderSize;
+            const int connectPayload = 1 + 2 + 4;
+
+            if (dataLength < connectPayload || received < p + connectPayload)
+                return false;
+
+            if ((InternalPacketType)data[p] != InternalPacketType.ConnectRequest)
+                return false;
+
+            ushort version = (ushort)(data[p + 1] | (data[p + 2] << 8));
+            uint key = (uint)(data[p + 3] | (data[p + 4] << 8) | (data[p + 5] << 16) | (data[p + 6] << 24));
+
+            return version == ProtocolVersion && key == ConnectionKey;
         }
 
         private NetworkPeer? AcceptConnection(PeerAddress peerAddr)
