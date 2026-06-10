@@ -160,6 +160,15 @@ namespace NetworkLibrary.Transport
             // Linux: one SO_REUSEPORT socket per thread (kernel load-balances).
             // Windows: one shared socket, multiple threads calling ReceiveFrom on it.
             bool useReusePort = RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && workerCount > 1;
+
+            // SO_REUSEPORT is best-effort: some environments (e.g. Docker Desktop's Linux VM) reject it with
+            // EOPNOTSUPP. Probe once and fall back to a single shared socket + multi-thread receive if unsupported.
+            if (useReusePort && !SupportsReusePort())
+            {
+                Console.WriteLine("[NetworkServer] SO_REUSEPORT unsupported here → single shared socket + multi-thread receive.");
+                useReusePort = false;
+            }
+
             int socketCount = useReusePort ? workerCount : 1;
 
             _sockets = new Socket[socketCount];
@@ -221,6 +230,22 @@ namespace NetworkLibrary.Transport
             // Start all receive threads after all sockets are bound
             for (int t = 0; t < workerCount; t++)
                 _receiveThreads[t].Start();
+        }
+
+        /// <summary>Probes whether SO_REUSEPORT can be set on a UDP socket here (best-effort; some kernels/containers
+        /// reject it). Done on a throwaway socket so <see cref="Start"/> can choose single-socket mode safely.</summary>
+        private static bool SupportsReusePort()
+        {
+            try
+            {
+                using var probe = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                probe.SetSocketOption(SocketOptionLevel.Socket, (SocketOptionName)15, true); // 15 = SO_REUSEPORT
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         /// <summary>
