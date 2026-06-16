@@ -39,11 +39,14 @@ namespace NetworkLibrary.Transport
     public sealed class ReliableChannel
     {
         /// <summary>Maximum number of in-flight packets before stalling.</summary>
-        /// <remarks>64 is sufficient for MMO workloads at 20 ticks/s even at 200ms RTT.
-        /// Lower values = dramatically less RAM per peer (each channel has 2x this many PendingPacket slots).
-        /// 64 allows 64 unacked packets in-flight, which at 20 pkt/s = 3.2s of buffer — more than enough.</remarks>
-        private const int WindowSize = 64;
+        /// <remarks>Must be a power of two (indexed via WindowMask). Bumped 64→256: AoI spawn/despawn + economy/loot
+        /// bursts can put well over 64 reliable packets in flight before ACKs return, and a full window silently drops
+        /// reliable sends. 256 slots × 2 channels per peer is trivial RAM and gives ~4× burst headroom.</remarks>
+        private const int WindowSize = 256;
         private const int WindowMask = WindowSize - 1;
+        /// <summary>After this many timed-out retransmits we WARN but keep retrying — we never deactivate a pending packet,
+        /// because deactivating it permanently stalls the ordered window (oldest-unacked can't advance past a dead slot).
+        /// A genuinely dead connection is caught by the heartbeat/timeout instead, which resets the whole channel.</summary>
         private const int MaxRetransmits = 10;
         private static readonly long DefaultRTOTicks = Stopwatch.Frequency; // 1 second default RTO
 
@@ -210,18 +213,12 @@ namespace NetworkLibrary.Transport
 
                     if (elapsed >= _retransmissionTimeout)
                     {
-                        if (packet.RetransmitCount >= MaxRetransmits)
-                        {
-                            // Give up on this packet — connection may be dead
-                            if (packet.Data != null)
-                            {
-                                ArrayPool<byte>.Shared.Return(packet.Data);
-                                packet.Data = null!;
-                            }
-                            packet.Active = false;
-                            _packetsLost++;
-                            continue;
-                        }
+                        // Keep retransmitting indefinitely. We must NOT deactivate the packet after MaxRetransmits:
+                        // doing so leaves a permanently-unacked hole that the oldest-unacked pointer can never advance
+                        // past → the send window fills and every future reliable send is silently dropped (a permanent
+                        // freeze of inventory/economy/spawn while unreliable snapshots keep flowing). A truly dead peer
+                        // is reaped by the heartbeat timeout (which Resets the channel); transient loss/bursts recover.
+                        if (packet.RetransmitCount == MaxRetransmits) _packetsLost++; // count once when it crosses the threshold
 
                         packet.SentTimestamp = now;
                         packet.RetransmitCount++;
