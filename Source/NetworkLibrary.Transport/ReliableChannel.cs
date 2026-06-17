@@ -38,11 +38,15 @@ namespace NetworkLibrary.Transport
     /// </summary>
     public sealed class ReliableChannel
     {
-        /// <summary>Maximum number of in-flight packets before stalling.</summary>
-        /// <remarks>Must be a power of two (indexed via WindowMask). Bumped 64→256: AoI spawn/despawn + economy/loot
-        /// bursts can put well over 64 reliable packets in flight before ACKs return, and a full window silently drops
-        /// reliable sends. 256 slots × 2 channels per peer is trivial RAM and gives ~4× burst headroom.</remarks>
-        private const int WindowSize = 256;
+        /// <summary>Maximum number of in-flight packets before stalling. MUST be ≤ 65 (ack + 64-bit bitmask) and a power
+        /// of two.</summary>
+        /// <remarks>The ACK is one sequence + a 64-bit bitmask = 65 packets confirmable per ACK message. The send window
+        /// MUST fit inside that, otherwise an in-flight packet can drift past the ACK coverage and be permanently
+        /// stranded under loss (ACKs ride lossy packets), sticking the oldest-unacked pointer → the window fills and
+        /// every reliable send is silently dropped = permanent stall. With a 64-bit bitmask, 64 is the largest
+        /// power-of-two ≤ 65, so EVERY in-flight packet is re-confirmed in EVERY ACK → robust to ACK loss, while still
+        /// absorbing bursts up to 64 reliable packets between polls (login spawn/inventory storms).</remarks>
+        private const int WindowSize = 64;
         private const int WindowMask = WindowSize - 1;
         /// <summary>After this many timed-out retransmits we WARN but keep retrying — we never deactivate a pending packet,
         /// because deactivating it permanently stalls the ordered window (oldest-unacked can't advance past a dead slot).
@@ -149,15 +153,15 @@ namespace NetworkLibrary.Transport
         /// </summary>
         /// <param name="ack">Most recent sequence number acknowledged by remote.</param>
         /// <param name="ackBits">Bitmask of 32 previous packets acknowledged (bit 0 = ack-1, bit 1 = ack-2, etc.).</param>
-        public void ProcessAck(ushort ack, uint ackBits)
+        public void ProcessAck(ushort ack, ulong ackBits)
         {
             // Acknowledge the main ack sequence
             AcknowledgePacket(ack);
 
-            // Acknowledge packets in the bitmask
-            for (int i = 0; i < 32; i++)
+            // Acknowledge packets in the bitmask (64 bits → covers the whole 64-packet window)
+            for (int i = 0; i < 64; i++)
             {
-                if ((ackBits & (1u << i)) != 0)
+                if ((ackBits & (1UL << i)) != 0)
                 {
                     ushort seq = (ushort)(ack - 1 - i);
                     AcknowledgePacket(seq);
@@ -321,19 +325,19 @@ namespace NetworkLibrary.Transport
         /// This should be included in every outgoing packet.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void GenerateAckData(out ushort ack, out uint ackBits)
+        public void GenerateAckData(out ushort ack, out ulong ackBits)
         {
             ack = _remoteSequence;
             ackBits = 0;
 
-            for (int i = 0; i < 32; i++)
+            for (int i = 0; i < 64; i++)
             {
                 ushort seq = (ushort)(_remoteSequence - 1 - i);
                 int index = seq & WindowMask;
 
                 if (_receiveBuffer[index].Active && _receiveBuffer[index].Sequence == seq)
                 {
-                    ackBits |= (1u << i);
+                    ackBits |= (1UL << i);
                 }
             }
         }

@@ -296,12 +296,29 @@ namespace NetworkLibrary.Transport
             // 1. Drain all received packets (thread-safe ConcurrentQueue)
             ReceivePackets();
 
-            // 2. Process retransmissions for all peers
+            // 2. Flush a dedicated ACK packet to every peer that received reliable data this tick (batched).
+            FlushAcks();
+
+            // 3. Process retransmissions for all peers
             ProcessRetransmissions();
 
-            // 3. Process timeouts and pings
+            // 4. Process timeouts and pings
             ProcessHeartbeats();
         }
+
+        private void FlushAcks()
+        {
+            foreach (var kvp in _peersByEndPoint)
+            {
+                var peer = kvp.Value;
+                if (peer.State == PeerState.Connected && peer.NeedsAck)
+                {
+                    SendAckPacket(peer);
+                    peer.NeedsAck = false;
+                }
+            }
+        }
+
 
         /// <summary>
         /// Sends data to a specific peer.
@@ -494,8 +511,7 @@ namespace NetworkLibrary.Transport
                 byte[] data = packet.Buffer;
                 var peerAddr = packet.Sender;
 
-                if (!PacketHeader.Read(data, received, out var delivery, out var sequence, out var ack,
-                    out var ackBits, out var dataLength))
+                if (!PacketHeader.Read(data, received, out var delivery, out var sequence, out var dataLength))
                 {
                     _bufferPool.Return(data);
                     continue;
@@ -524,21 +540,25 @@ namespace NetworkLibrary.Transport
                 }
 
                 peer.LastReceiveTime = System.Diagnostics.Stopwatch.GetTimestamp();
-                ProcessReceive(peer, data, received, dataLength, delivery, sequence, ack, ackBits, storeData: true);
+                ProcessReceive(peer, data, received, dataLength, delivery, sequence, storeData: true);
             }
         }
 
-        private void ProcessReceive(NetworkPeer peer, byte[] buffer, int totalReceived, int dataLength, DeliveryMethod delivery, 
-ushort sequence, ushort ack, uint ackBits, bool storeData)
+        private void ProcessReceive(NetworkPeer peer, byte[] buffer, int totalReceived, int dataLength, DeliveryMethod delivery,
+ushort sequence, bool storeData)
         {
-            // Process ACKs (Both Reliable and ReliableOrdered)
-            if (delivery == DeliveryMethod.Reliable || delivery == DeliveryMethod.ReliableOrdered)
+            // Dedicated ACK packet → route each channel's ACK state to its channel and we're done (no app payload).
+            if (delivery == DeliveryMethod.Ack)
             {
-                peer._reliableChannel.ProcessAck(ack, ackBits);
-                peer._reliableOrderedChannel.ProcessAck(ack, ackBits);
+                if (totalReceived >= PacketHeader.HeaderSize + PacketHeader.AckPayloadSize)
+                {
+                    PacketHeader.ReadAckPayload(buffer, PacketHeader.HeaderSize, out var ack, out var ackBits, out var ackOrdered, out var ackBitsOrdered);
+                    peer._reliableChannel.ProcessAck(ack, ackBits);
+                    peer._reliableOrderedChannel.ProcessAck(ackOrdered, ackBitsOrdered);
+                }
+                _bufferPool.Return(buffer);
+                return;
             }
-
-            int payloadLength = Math.Min(dataLength, totalReceived - PacketHeader.HeaderSize);
 
             switch (delivery)
             {
@@ -546,7 +566,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                     ProcessInternalPacket(peer, buffer, PacketHeader.HeaderSize, dataLength);
                     _bufferPool.Return(buffer);
                     return;
-                
+
                 // Unreliable
                 case DeliveryMethod.Unreliable:
                     peer.ProcessUnreliableSequence(sequence);
@@ -555,6 +575,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                     return;
 
                 case DeliveryMethod.Reliable:
+                    peer.NeedsAck = true; // schedule a dedicated Ack packet next Update
                     if (peer._reliableChannel.ProcessReceive(sequence, buffer, PacketHeader.HeaderSize, dataLength))
                     {
                         RaiseDataReceived(peer, buffer, PacketHeader.HeaderSize, dataLength, delivery);
@@ -562,6 +583,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                     break;
 
                 case DeliveryMethod.ReliableOrdered:
+                    peer.NeedsAck = true;
                     peer._reliableOrderedChannel.ProcessReceive(sequence, buffer, PacketHeader.HeaderSize, dataLength, true);
                     // Deliver in order
                     while (peer._reliableOrderedChannel.TryGetNextOrdered(out var orderedData, out var orderedLen))
@@ -572,6 +594,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                     break;
 
                 case DeliveryMethod.ReliableFragment:
+                    peer.NeedsAck = true;
                     if (peer._reliableChannel.ProcessReceive(sequence, buffer, PacketHeader.HeaderSize, dataLength))
                     {
                         if (peer._fragmentChannel.ProcessFragment(buffer, PacketHeader.HeaderSize, dataLength, out var completeData, out var completeLen))
@@ -583,6 +606,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                     break;
 
                 case DeliveryMethod.ReliableOrderedFragment:
+                    peer.NeedsAck = true;
                     peer._reliableOrderedChannel.ProcessReceive(sequence, buffer, PacketHeader.HeaderSize, dataLength, true);
                     while (peer._reliableOrderedChannel.TryGetNextOrdered(out var orderedData, out var orderedLen))
                     {
@@ -628,12 +652,10 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                     int count = reliable.GetPacketsToRetransmit(_retransmitBuffer, _retransmitBuffer.Length);
                     if (count > 0)
                     {
-                        // ACK state is identical for every packet in this batch — compute once.
-                        reliable.GenerateAckData(out var ack, out var ackBits);
                         for (int i = 0; i < count; i++)
                         {
                             ref var pkt = ref _retransmitBuffer[i];
-                            SendRawPacket(peer, DeliveryMethod.Reliable, pkt.Sequence, ack, ackBits, pkt.Data, 0, pkt.DataLength);
+                            SendRawPacket(peer, DeliveryMethod.Reliable, pkt.Sequence, pkt.Data, 0, pkt.DataLength); // both ACKs piggybacked inside
                         }
                     }
                 }
@@ -644,11 +666,10 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                     int count = ordered.GetPacketsToRetransmit(_retransmitBuffer, _retransmitBuffer.Length);
                     if (count > 0)
                     {
-                        ordered.GenerateAckData(out var ack, out var ackBits);
                         for (int i = 0; i < count; i++)
                         {
                             ref var pkt = ref _retransmitBuffer[i];
-                            SendRawPacket(peer, DeliveryMethod.ReliableOrdered, pkt.Sequence, ack, ackBits, pkt.Data, 0, pkt.DataLength);
+                            SendRawPacket(peer, DeliveryMethod.ReliableOrdered, pkt.Sequence, pkt.Data, 0, pkt.DataLength);
                         }
                     }
                 }
@@ -669,11 +690,12 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                     continue;
                 }
 
-                // Ping check
+                // Ping check (also a convenient periodic slot to reap timed-out fragment reassemblies — see #2)
                 if (peer.State == PeerState.Connected && (now - peer._lastPingTime) > _pingInterval)
                 {
                     SendInternalPacket(peer, InternalPacketType.Ping);
                     peer._lastPingTime = now;
+                    peer._fragmentChannel.CleanupTimedOut(); // free buffers of incomplete (lost-fragment) reassemblies
                 }
             }
 
@@ -764,15 +786,13 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
         private void SendUnreliable(NetworkPeer peer, byte[] data, int offset, int length)
         {
             ushort seq = peer.NextUnreliableSequence();
-            peer._reliableChannel.GenerateAckData(out var ack, out var ackBits);
-            SendRawPacket(peer, DeliveryMethod.Unreliable, seq, ack, ackBits, data, offset, length);
+            SendRawPacket(peer, DeliveryMethod.Unreliable, seq, data, offset, length); // SendRawPacket piggybacks both channels' ACKs
         }
 
         private void SendSequenced(NetworkPeer peer, byte[] data, int offset, int length)
         {
             ushort seq = peer.NextSequencedSequence();
-            peer._reliableChannel.GenerateAckData(out var ack, out var ackBits);
-            SendRawPacket(peer, DeliveryMethod.Sequenced, seq, ack, ackBits, data, offset, length);
+            SendRawPacket(peer, DeliveryMethod.Sequenced, seq, data, offset, length);
         }
 
         private void SendReliable(NetworkPeer peer, byte[] data, int offset, int length, ReliableChannel channel, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable)
@@ -783,8 +803,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                 return; // Window full, drop
 
             ushort seq = (ushort)seqResult;
-            channel.GenerateAckData(out var ack, out var ackBits);
-            SendRawPacket(peer, deliveryMethod, seq, ack, ackBits, data, offset, length);
+            SendRawPacket(peer, deliveryMethod, seq, data, offset, length);
         }
 
         private void SendFragmented(NetworkPeer peer, byte[] data, int offset, int length, DeliveryMethod delivery)
@@ -812,8 +831,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
             const int totalLength = PacketHeader.HeaderSize + 1;
             Span<byte> buf = stackalloc byte[totalLength];
 
-            peer._reliableChannel.GenerateAckData(out var ack, out var ackBits);
-            PacketHeader.Write(buf, DeliveryMethod.Internal, 0, ack, ackBits, 1);
+            PacketHeader.Write(buf, DeliveryMethod.Internal, 0, 1);
             buf[PacketHeader.HeaderSize] = (byte)type;
 
             SendRawTo(peer, buf);
@@ -847,7 +865,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
             }
         }
 
-        private void SendRawPacket(NetworkPeer peer, DeliveryMethod delivery, ushort sequence, ushort ack, uint ackBits, byte[] data, int offset, int length)
+        private void SendRawPacket(NetworkPeer peer, DeliveryMethod delivery, ushort sequence, byte[] data, int offset, int length)
         {
             int totalLength = PacketHeader.HeaderSize + length;
 
@@ -856,7 +874,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
             if (totalLength <= PacketHeader.SafeMTU)
             {
                 Span<byte> packet = stackalloc byte[totalLength];
-                PacketHeader.Write(packet, delivery, sequence, ack, ackBits, (ushort)length);
+                PacketHeader.Write(packet, delivery, sequence, (ushort)length);
                 data.AsSpan(offset, length).CopyTo(packet.Slice(PacketHeader.HeaderSize));
                 SendRawTo(peer, packet);
             }
@@ -864,13 +882,27 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
             {
                 // Oversized (e.g. large Unreliable that bypasses fragmentation) — fall back to the pool.
                 byte[] rented = _bufferPool.Rent(totalLength);
-                PacketHeader.Write(rented, delivery, sequence, ack, ackBits, (ushort)length);
+                PacketHeader.Write(rented, delivery, sequence, (ushort)length);
                 Buffer.BlockCopy(data, offset, rented, PacketHeader.HeaderSize, length);
                 SendRawTo(peer, rented.AsSpan(0, totalLength));
                 _bufferPool.Return(rented);
             }
 
             peer.LastSendTime = Stopwatch.GetTimestamp();
+        }
+
+        /// <summary>Sends a dedicated ACK packet carrying BOTH reliable channels' ACK state. Flushed once per Update for
+        /// peers that received reliable data — driven by receiving, so one-way reliable traffic is still acked.</summary>
+        private void SendAckPacket(NetworkPeer peer)
+        {
+            peer._reliableChannel.GenerateAckData(out var ack, out var ackBits);
+            peer._reliableOrderedChannel.GenerateAckData(out var ackO, out var ackBitsO);
+
+            const int totalLength = PacketHeader.HeaderSize + PacketHeader.AckPayloadSize;
+            Span<byte> packet = stackalloc byte[totalLength];
+            PacketHeader.Write(packet, DeliveryMethod.Ack, 0, PacketHeader.AckPayloadSize);
+            PacketHeader.WriteAckPayload(packet, PacketHeader.HeaderSize, ack, ackBits, ackO, ackBitsO);
+            SendRawTo(peer, packet);
         }
 
 #if NETSTANDARD2_1

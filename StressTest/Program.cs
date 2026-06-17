@@ -44,6 +44,14 @@ namespace StressTest
                 return;
             }
 
+            // Reliability-under-loss mode: validates the ReliableOrdered channel survives heavy loss + many peers
+            // with NO permanent stall (the bug fixed 2026-06-15). Run: NL_RELIABILITY=1 dotnet run -c Release
+            if (Environment.GetEnvironmentVariable("NL_RELIABILITY") == "1")
+            {
+                RunReliabilityTest();
+                return;
+            }
+
             Console.WriteLine("=====================================");
             Console.WriteLine($"   MMORPG STRESS TEST ({Protocol})   ");
             Console.WriteLine("=====================================");
@@ -130,6 +138,149 @@ namespace StressTest
                 long total = after - before;
                 Console.WriteLine($"{n,6} clients: {total / 1024.0 / 1024.0,7:F2} MB total  |  {(double)total / n,7:F0} bytes/client");
             }
+        }
+
+        // === RELIABILITY-UNDER-LOSS TEST (NL_RELIABILITY=1) ===
+        // The server streams a numbered ReliableOrdered sequence to EVERY client under heavy packet loss; each client
+        // must receive the WHOLE sequence strictly in order (retransmits recover every loss) with NO permanent stall.
+        // Clients send unreliable "movement" so ACKs piggyback back, exactly like the game. Proves the reliable-channel
+        // fix (never give up / window 256) holds under stress, and gives a keep-vs-swap-transport data point.
+        sealed class RelState { public int Expected; public int Received; public int OutOfOrder; public long LastProgress; public NetPeer? Peer; }
+
+        static void RunReliabilityTest()
+        {
+            int RelClients = int.TryParse(Environment.GetEnvironmentVariable("NL_REL_CLIENTS"), out var rc) ? rc : 300;
+            const int DurationSec = 30;
+            int ServerOrderedPerSec = int.TryParse(Environment.GetEnvironmentVariable("NL_REL_RATE"), out var rr) ? rr : 10;
+            const int ClientMovePerSec = 15;     // unreliable movement (carries ACKs back), per client
+            float Loss = float.TryParse(Environment.GetEnvironmentVariable("NL_REL_LOSS"), out var ls) ? ls : 8f;
+            int Latency = 80, Jitter = 30;
+
+            Console.WriteLine("=====================================");
+            Console.WriteLine("  RELIABILITY UNDER LOSS (ordered)   ");
+            Console.WriteLine($"  {RelClients} clients | {Loss}% loss | {Latency}±{Jitter}ms | {DurationSec}s");
+            Console.WriteLine("=====================================");
+
+            var srvPeers = new List<NetPeer>();
+            object srvLock = new();
+            var peerSeq = new System.Collections.Concurrent.ConcurrentDictionary<NetPeer, int>();
+            var srvListener = new EventBasedNetListener();
+            srvListener.PeerConnectedEvent += p => { peerSeq[p] = 0; lock (srvLock) srvPeers.Add(p); };
+            srvListener.PeerDisconnectedEvent += (p, r) => { lock (srvLock) srvPeers.Remove(p); };
+            srvListener.NetworkReceiveEvent += (p, reader, m) => { }; // client movement/acks: nothing to verify here
+            var server = new NetManager(srvListener, TransportType.Udp);
+            if (server.Simulator != null) { server.Simulator.Enabled = true; server.Simulator.PacketLossPercent = Loss; server.Simulator.LatencyMs = Latency; server.Simulator.JitterMs = Jitter; }
+            server.Start(Port, 1);
+
+            var states = new RelState[RelClients];
+            var clients = new NetManager[RelClients];
+            for (int i = 0; i < RelClients; i++)
+            {
+                var st = new RelState { LastProgress = Stopwatch.GetTimestamp() };
+                states[i] = st;
+                var cl = new EventBasedNetListener();
+                cl.PeerConnectedEvent += p => st.Peer = p;
+                cl.NetworkReceiveEvent += (p, reader, m) =>
+                {
+                    if (reader.ReadByte() != 3) return;        // only the ordered stream
+                    int seq = reader.ReadInt();
+                    if (seq == st.Expected) { st.Expected++; st.Received++; st.LastProgress = Stopwatch.GetTimestamp(); }
+                    else if (seq > st.Expected) st.OutOfOrder++; // ordered channel must NEVER skip ahead
+                    // seq < Expected = duplicate → ignore
+                };
+                var c = new NetManager(cl, TransportType.Udp);
+                if (c.Simulator != null) { c.Simulator.Enabled = true; c.Simulator.PacketLossPercent = Loss; c.Simulator.LatencyMs = Latency; c.Simulator.JitterMs = Jitter; }
+                c.Connect("127.0.0.1", Port);
+                clients[i] = c;
+                if (i % 50 == 0) Thread.Sleep(10); // avoid a connect storm
+            }
+
+            long freq = Stopwatch.Frequency;
+            long connectDeadline = Stopwatch.GetTimestamp() + 15 * freq;
+            while (Stopwatch.GetTimestamp() < connectDeadline)
+            {
+                server.PollEvents();
+                for (int i = 0; i < clients.Length; i++) clients[i].PollEvents();
+                int n; lock (srvLock) n = srvPeers.Count;
+                if (n >= RelClients) break;
+                Thread.Sleep(5);
+            }
+            int connected; lock (srvLock) connected = srvPeers.Count;
+            Console.WriteLine($"Connected: {connected}/{RelClients}");
+
+            long start = Stopwatch.GetTimestamp();
+            long end = start + DurationSec * freq;
+            long sendInterval = ServerOrderedPerSec > 0 ? freq / ServerOrderedPerSec : long.MaxValue, moveInterval = freq / ClientMovePerSec;
+            long nextSend = start, nextMove = start, totalSent = 0;
+            long lastReport = start;
+            while (Stopwatch.GetTimestamp() < end)
+            {
+                server.PollEvents();
+                for (int i = 0; i < clients.Length; i++) clients[i].PollEvents();
+                long now = Stopwatch.GetTimestamp();
+
+                if (now >= nextSend)
+                {
+                    nextSend += sendInterval;
+                    NetPeer[] snap; lock (srvLock) snap = srvPeers.ToArray();
+                    for (int i = 0; i < snap.Length; i++)
+                    {
+                        var p = snap[i];
+                        int seq = peerSeq.TryGetValue(p, out var s) ? s : 0;
+                        var w = new BitBuffer(); w.AddByte(3); w.AddInt(seq); p.Send(w, DeliveryMethod.ReliableOrdered); w.Dispose();
+                        peerSeq[p] = seq + 1; totalSent++;
+                    }
+                }
+                if (now >= nextMove)
+                {
+                    nextMove += moveInterval;
+                    for (int i = 0; i < clients.Length; i++) { var p = states[i].Peer; if (p == null) continue; var w = new BitBuffer(); w.AddByte(1); w.AddInt(i); p.Send(w, DeliveryMethod.Unreliable); w.Dispose(); }
+                }
+                if (now - lastReport >= 5 * freq)
+                {
+                    lastReport = now;
+                    long rec = 0; for (int i = 0; i < states.Length; i++) rec += states[i].Received;
+                    Console.WriteLine($"  t={(now - start) / freq,2}s  sent={totalSent}  received={rec}");
+                }
+                Thread.Sleep(1);
+            }
+
+            // Drain: stop the ordered stream, keep polling + acking so retransmits land.
+            Console.WriteLine("Draining retransmits (8s)...");
+            long drainEnd = Stopwatch.GetTimestamp() + 8 * freq;
+            while (Stopwatch.GetTimestamp() < drainEnd)
+            {
+                server.PollEvents();
+                for (int i = 0; i < clients.Length; i++) clients[i].PollEvents();
+                long now = Stopwatch.GetTimestamp();
+                if (now >= nextMove)
+                {
+                    nextMove += moveInterval;
+                    for (int i = 0; i < clients.Length; i++) { var p = states[i].Peer; if (p == null) continue; var w = new BitBuffer(); w.AddByte(1); w.AddInt(i); p.Send(w, DeliveryMethod.Unreliable); w.Dispose(); }
+                }
+                Thread.Sleep(1);
+            }
+
+            long totalReceived = 0; int ooo = 0, stalled = 0, minRec = int.MaxValue, maxRec = 0;
+            double avgPerPeer = connected > 0 ? (double)totalSent / connected : 0;
+            for (int i = 0; i < states.Length; i++)
+            {
+                var st = states[i];
+                totalReceived += st.Received; ooo += st.OutOfOrder;
+                if (st.Received < minRec) minRec = st.Received;
+                if (st.Received > maxRec) maxRec = st.Received;
+                if (st.Received < avgPerPeer * 0.90) stalled++;
+            }
+            double deliveryPct = totalSent > 0 ? 100.0 * totalReceived / totalSent : 0;
+            Console.WriteLine("───── RESULT ─────");
+            Console.WriteLine($"Ordered sent (total):     {totalSent}");
+            Console.WriteLine($"Ordered received (total): {totalReceived}  ({deliveryPct:F2}%)");
+            Console.WriteLine($"Per-client received:      min {minRec} / avg {avgPerPeer:F0} / max {maxRec}");
+            Console.WriteLine($"Out-of-order (must be 0): {ooo}");
+            Console.WriteLine($"Stalled clients (<90%):   {stalled}");
+            bool pass = ooo == 0 && stalled == 0 && deliveryPct >= 99.5;
+            Console.WriteLine(pass ? "VERDICT: PASS ✅ reliable-ordered survived loss+load, no stall"
+                                   : "VERDICT: FAIL ❌ — stall/loss/order issue, investigate");
         }
 
         static NetManager StartServer()

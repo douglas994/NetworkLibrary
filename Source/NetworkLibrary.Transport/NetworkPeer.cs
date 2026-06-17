@@ -71,6 +71,9 @@ namespace NetworkLibrary.Transport
         internal readonly ReliableChannel _reliableOrderedChannel;
         internal readonly FragmentChannel _fragmentChannel;
 
+        // Set when a reliable/ordered packet is received → a dedicated Ack packet is flushed next Update (batched).
+        internal bool NeedsAck;
+
         // Unreliable sequencing
         private ushort _unreliableLocalSequence;
         private ushort _unreliableRemoteSequence;
@@ -171,6 +174,7 @@ namespace NetworkLibrary.Transport
             _lastPingTime = 0;
             _pingSequence = 0;
 
+            NeedsAck = false;
             _reliableChannel.Reset();
             _reliableOrderedChannel.Reset();
         }

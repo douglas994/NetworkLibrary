@@ -52,6 +52,7 @@ namespace NetworkLibrary.Transport
         // ── Channels ──
         private readonly ReliableChannel _reliableChannel;
         private readonly ReliableChannel _reliableOrderedChannel;
+        private bool _needsAck; // set when reliable/ordered data is received → flush a dedicated Ack packet next Update
         private readonly FragmentChannel _fragmentChannel;
 
         // ── Sequencing ──
@@ -211,6 +212,9 @@ namespace NetworkLibrary.Transport
             }
             else if (State == ClientState.Connected)
             {
+                // Flush a dedicated ACK packet if we received reliable data this tick (batched, both channels).
+                if (_needsAck) { SendAckPacket(); _needsAck = false; }
+
                 // Retransmissions
                 ProcessRetransmissions();
 
@@ -223,11 +227,12 @@ namespace NetworkLibrary.Transport
                     return;
                 }
 
-                // Ping
+                // Ping (also reap timed-out fragment reassemblies — see #2)
                 if ((now - _lastPingTime) > _pingInterval)
                 {
                     SendInternalPacket(InternalPacketType.Ping);
                     _lastPingTime = now;
+                    _fragmentChannel.CleanupTimedOut();
                 }
             }
         }
@@ -326,8 +331,7 @@ namespace NetworkLibrary.Transport
                 int received = packet.Length;
                 byte[] data = packet.Buffer;
 
-                if (!PacketHeader.Read(data, received, out var delivery, out var sequence, out var ack, 
-out var ackBits, out var dataLength))
+                if (!PacketHeader.Read(data, received, out var delivery, out var sequence, out var dataLength))
                 {
                     _bufferPool.Return(data);
                     continue;
@@ -349,18 +353,24 @@ out var ackBits, out var dataLength))
                     continue;
                 }
 
-                ProcessReceive(data, received, dataLength, delivery, sequence, ack, ackBits, storeData: true);
+                ProcessReceive(data, received, dataLength, delivery, sequence, storeData: true);
             }
         }
 
-        private void ProcessReceive(byte[] buffer, int totalReceived, int dataLength, DeliveryMethod delivery, 
-ushort sequence, ushort ack, uint ackBits, bool storeData)
+        private void ProcessReceive(byte[] buffer, int totalReceived, int dataLength, DeliveryMethod delivery,
+ushort sequence, bool storeData)
         {
-            // Process ACKs
-            if (delivery == DeliveryMethod.Reliable || delivery == DeliveryMethod.ReliableOrdered)
+            // Dedicated ACK packet → route each channel's ACK state to its channel and we're done (no app payload).
+            if (delivery == DeliveryMethod.Ack)
             {
-                _reliableChannel.ProcessAck(ack, ackBits);
-                _reliableOrderedChannel.ProcessAck(ack, ackBits);
+                if (totalReceived >= PacketHeader.HeaderSize + PacketHeader.AckPayloadSize)
+                {
+                    PacketHeader.ReadAckPayload(buffer, PacketHeader.HeaderSize, out var ack, out var ackBits, out var ackOrdered, out var ackBitsOrdered);
+                    _reliableChannel.ProcessAck(ack, ackBits);
+                    _reliableOrderedChannel.ProcessAck(ackOrdered, ackBitsOrdered);
+                }
+                _bufferPool.Return(buffer);
+                return;
             }
 
             int payloadLength = Math.Min(dataLength, totalReceived - PacketHeader.HeaderSize);
@@ -373,6 +383,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                     return;
 
                 case DeliveryMethod.Reliable:
+                    _needsAck = true; // schedule a dedicated Ack packet next Update
                     if (_reliableChannel.ProcessReceive(sequence, buffer, PacketHeader.HeaderSize, payloadLength))
                     {
                         RaiseDataReceived(buffer, PacketHeader.HeaderSize, payloadLength, delivery);
@@ -380,6 +391,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                     break;
 
                 case DeliveryMethod.ReliableOrdered:
+                    _needsAck = true;
                     _reliableOrderedChannel.ProcessReceive(sequence, buffer, PacketHeader.HeaderSize, payloadLength, true);
                     while (_reliableOrderedChannel.TryGetNextOrdered(out var orderedData, out var orderedLen))
                     {
@@ -389,6 +401,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                     break;
 
                 case DeliveryMethod.ReliableFragment:
+                    _needsAck = true;
                     if (_reliableChannel.ProcessReceive(sequence, buffer, PacketHeader.HeaderSize, payloadLength))
                     {
                         if (_fragmentChannel.ProcessFragment(buffer, PacketHeader.HeaderSize, payloadLength, out var completeData, out var completeLen))
@@ -400,6 +413,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                     break;
 
                 case DeliveryMethod.ReliableOrderedFragment:
+                    _needsAck = true;
                     _reliableOrderedChannel.ProcessReceive(sequence, buffer, PacketHeader.HeaderSize, payloadLength, true);
                     while (_reliableOrderedChannel.TryGetNextOrdered(out var orderedData, out var orderedLen))
                     {
@@ -451,16 +465,14 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
             for (int i = 0; i < count; i++)
             {
                 ref var pkt = ref _retransmitBuffer[i];
-                _reliableChannel.GenerateAckData(out var ack, out var ackBits);
-                SendRawPacket(DeliveryMethod.Reliable, pkt.Sequence, ack, ackBits, pkt.Data, 0, pkt.DataLength);
+                SendRawPacket(DeliveryMethod.Reliable, pkt.Sequence, pkt.Data, 0, pkt.DataLength); // both ACKs piggybacked inside
             }
 
             count = _reliableOrderedChannel.GetPacketsToRetransmit(_retransmitBuffer, _retransmitBuffer.Length);
             for (int i = 0; i < count; i++)
             {
                 ref var pkt = ref _retransmitBuffer[i];
-                _reliableOrderedChannel.GenerateAckData(out var ack, out var ackBits);
-                SendRawPacket(DeliveryMethod.ReliableOrdered, pkt.Sequence, ack, ackBits, pkt.Data, 0, pkt.DataLength);
+                SendRawPacket(DeliveryMethod.ReliableOrdered, pkt.Sequence, pkt.Data, 0, pkt.DataLength);
             }
         }
 
@@ -519,8 +531,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                 buf[p + 5] = (byte)((ConnectionKey >> 16) & 0xFF);
                 buf[p + 6] = (byte)((ConnectionKey >> 24) & 0xFF);
 
-                _reliableChannel.GenerateAckData(out var ack, out var ackBits);
-                PacketHeader.Write(buf, DeliveryMethod.Internal, 0, ack, ackBits, payloadLen);
+                PacketHeader.Write(buf, DeliveryMethod.Internal, 0, payloadLen);
 
                 SendRawTo(buf, PacketHeader.HeaderSize + payloadLen);
                 _bufferPool.Return(buf);
@@ -534,8 +545,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                 byte[] buf = _bufferPool.Rent(PacketHeader.SafeMTU);
                 buf[PacketHeader.HeaderSize] = (byte)type;
 
-                _reliableChannel.GenerateAckData(out var ack, out var ackBits);
-                PacketHeader.Write(buf, DeliveryMethod.Internal, 0, ack, ackBits, 1);
+                PacketHeader.Write(buf, DeliveryMethod.Internal, 0, 1);
 
                 int totalLength = PacketHeader.HeaderSize + 1;
                 SendRawTo(buf, totalLength);
@@ -546,15 +556,13 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
         private void SendUnreliable(byte[] data, int offset, int length)
         {
             ushort seq = _unreliableLocalSequence++;
-            _reliableChannel.GenerateAckData(out var ack, out var ackBits);
-            SendRawPacket(DeliveryMethod.Unreliable, seq, ack, ackBits, data, offset, length);
+            SendRawPacket(DeliveryMethod.Unreliable, seq, data, offset, length); // SendRawPacket piggybacks both channels' ACKs
         }
 
         private void SendSequenced(byte[] data, int offset, int length)
         {
             ushort seq = _sequencedLocalSequence++;
-            _reliableChannel.GenerateAckData(out var ack, out var ackBits);
-            SendRawPacket(DeliveryMethod.Sequenced, seq, ack, ackBits, data, offset, length);
+            SendRawPacket(DeliveryMethod.Sequenced, seq, data, offset, length);
         }
 
         private void SendReliable(byte[] data, int offset, int length, ReliableChannel channel, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable)
@@ -565,8 +573,7 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
                 return; // Window full, drop
 
             ushort seq = (ushort)seqResult;
-            channel.GenerateAckData(out var ack, out var ackBits);
-            SendRawPacket(deliveryMethod, seq, ack, ackBits, data, offset, length);
+            SendRawPacket(deliveryMethod, seq, data, offset, length);
         }
 
         private void SendFragmented(byte[] data, int offset, int length, DeliveryMethod delivery)
@@ -599,15 +606,33 @@ ushort sequence, ushort ack, uint ackBits, bool storeData)
             return false;
         }
 
-        private void SendRawPacket(DeliveryMethod delivery, ushort sequence, ushort ack, uint ackBits, byte[] data, int offset, int length)
+        private void SendRawPacket(DeliveryMethod delivery, ushort sequence, byte[] data, int offset, int length)
         {
             lock (_sendLock)
             {
                 int totalLength = PacketHeader.HeaderSize + length;
                 byte[] buf = _bufferPool.Rent(totalLength);
-                PacketHeader.Write(buf, delivery, sequence, ack, ackBits, (ushort)length);
+                PacketHeader.Write(buf, delivery, sequence, (ushort)length);
                 Buffer.BlockCopy(data, offset, buf, PacketHeader.HeaderSize, length);
 
+                SendRawTo(buf, totalLength);
+                _bufferPool.Return(buf);
+            }
+        }
+
+        /// <summary>Sends a dedicated ACK packet carrying both reliable channels' ACK state (flushed once per Update when
+        /// reliable data was received). Driven by receiving, so server→client reliable traffic is acked even if we send
+        /// nothing of our own.</summary>
+        private void SendAckPacket()
+        {
+            _reliableChannel.GenerateAckData(out var ack, out var ackBits);
+            _reliableOrderedChannel.GenerateAckData(out var ackO, out var ackBitsO);
+            lock (_sendLock)
+            {
+                const int totalLength = PacketHeader.HeaderSize + PacketHeader.AckPayloadSize;
+                byte[] buf = _bufferPool.Rent(totalLength);
+                PacketHeader.Write(buf, DeliveryMethod.Ack, 0, PacketHeader.AckPayloadSize);
+                PacketHeader.WriteAckPayload(buf, PacketHeader.HeaderSize, ack, ackBits, ackO, ackBitsO);
                 SendRawTo(buf, totalLength);
                 _bufferPool.Return(buf);
             }
