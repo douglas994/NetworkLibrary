@@ -7,6 +7,7 @@
  */
 
 using System;
+using System.Net;
 using NetworkLibrary.Packets;
 using NetworkLibrary.Serialization;
 using NetworkLibrary.Transport;
@@ -30,17 +31,22 @@ namespace NetworkLibrary
         /// <summary>Unique ID assigned to this peer (0 if this is a client endpoint).</summary>
         public uint Id { get; }
 
+        /// <summary>The peer's remote address (server-side; null for a local client peer). Lets the application do
+        /// per-IP policy — connection rate-limiting, login throttling, bans — without reaching into the transport.</summary>
+        public EndPoint? RemoteEndPoint { get; }
+
         /// <summary>Attach any custom game data here (e.g., your Player object).</summary>
         public object? UserData { get; set; }
 
         private readonly Action<byte[], int, int, DeliveryMethod> _sendCallback;
         private readonly Action _disconnectCallback;
 
-        internal NetPeer(uint id, Action<byte[], int, int, DeliveryMethod> sendCallback, Action disconnectCallback)
+        internal NetPeer(uint id, Action<byte[], int, int, DeliveryMethod> sendCallback, Action disconnectCallback, EndPoint? remoteEndPoint = null)
         {
             Id = id;
             _sendCallback = sendCallback;
             _disconnectCallback = disconnectCallback;
+            RemoteEndPoint = remoteEndPoint;
         }
 
         /// <summary>

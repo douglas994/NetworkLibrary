@@ -110,8 +110,9 @@ namespace NetworkLibrary
                 {
                     var netPeer = new NetPeer(p.PeerId,
                         (data, offset, len, method) => _udpServer.Send(p, data, offset, len, method),
-                        () => _udpServer.DisconnectPeer(p));
-                    
+                        () => _udpServer.DisconnectPeer(p),
+                        p.RemoteEndPoint);
+
                     _peers[p.PeerId] = netPeer;
                     _listener.OnPeerConnected(netPeer);
                 };
@@ -148,7 +149,8 @@ namespace NetworkLibrary
                 {
                     var netPeer = new NetPeer(p.PeerId,
                         (data, offset, len, method) => p.Send(data, offset, len), // TCP inherently ignores DeliveryMethod
-                        () => p.Disconnect());
+                        () => p.Disconnect(),
+                        p.RemoteEndPoint);
 
                     _peers[p.PeerId] = netPeer;
                     _listener.OnPeerConnected(netPeer);

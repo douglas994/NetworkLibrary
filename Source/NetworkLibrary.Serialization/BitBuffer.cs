@@ -154,7 +154,11 @@ namespace NetworkLibrary.Serialization
         public uint ReadRaw(int numBits)
         {
             Debug.Assert(numBits > 0 && numBits <= 32, "numBits must be between 1 and 32");
-            Debug.Assert(_readPosition + numBits <= _writePosition, "Read past end of buffer");
+            // REAL bounds check (not Debug-only): a truncated/malformed packet must THROW — to be caught by the
+            // service's receive try/catch and dropped — instead of silently returning adjacent pooled memory (a data
+            // leak) or crashing on a raw array index in Release. This is what makes "drop the bad packet" actually safe.
+            if (_readPosition + numBits > _writePosition)
+                throw new System.InvalidOperationException("BitBuffer: read past end of buffer (malformed/truncated data)");
 
             int chunkIndex = _readPosition >> 5;
             int bitOffset = _readPosition & 31;
@@ -260,6 +264,25 @@ namespace NetworkLibrary.Serialization
         public uint ReadUInt()
         {
             return ReadRaw(32);
+        }
+
+        /// <summary>Writes a 64-bit unsigned integer as two 32-bit words (low then high).
+        /// Statement-style internally (AddRaw mutates `this`) — never fluent-chain when calling this.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public BitBuffer AddULong(ulong value)
+        {
+            AddRaw(32, (uint)(value & 0xFFFFFFFFu));
+            AddRaw(32, (uint)(value >> 32));
+            return this;
+        }
+
+        /// <summary>Reads a 64-bit unsigned integer (low word then high word).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public ulong ReadULong()
+        {
+            ulong lo = ReadRaw(32);
+            ulong hi = ReadRaw(32);
+            return lo | (hi << 32);
         }
 
         // ═══════════════════════════════════════════════════════
