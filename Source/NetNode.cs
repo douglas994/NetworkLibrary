@@ -1,6 +1,6 @@
 /*
  *  NetworkLibrary - High-Performance Networking for MMORPGs
- *  Module: Core API - NetManager
+ *  Module: Core API - NetNode
  *
  *  The centralized Manager that abstracts UDP and TCP.
  *  Uses Pluggable Transports depending on initialization.
@@ -19,24 +19,23 @@ namespace NetworkLibrary
     /// The Centralized Network Manager. 
     /// Manages connections, routes events to the listener, and encapsulates the UDP/TCP complexity.
     /// </summary>
-    public sealed class NetManager : IDisposable
+    public sealed class NetNode : IDisposable
     {
         private readonly INetEventListener _listener;
         private readonly TransportType _transportType;
 
-        // Server Backends
-        private NetworkServer? _udpServer;
-        private TcpServer? _tcpServer;
+        // UDP Backend (client + server) — LiteNetLib under the hood.
+        private LiteNetUdpTransport? _udp;
 
-        // Client Backends
-        private NetworkClient? _udpClient;
+        // TCP Backends
+        private TcpServer? _tcpServer;
         private TcpClient? _tcpClient;
         private NetPeer? _clientPeer;
 
         /// <summary>
         /// Gets the network condition simulator if using UDP. Returns null for TCP.
         /// </summary>
-        public NetworkConditionSimulator? Simulator => _udpServer?.Simulator ?? _udpClient?.Simulator;
+        public NetworkConditionSimulator? Simulator => _udp?.Simulator;
 
         public PacketDispatcher Packets { get; } = new PacketDispatcher();
 
@@ -62,7 +61,7 @@ namespace NetworkLibrary
         /// <summary>True if the server is listening or the client is connected.</summary>
         public bool IsRunning { get; private set; }
 
-        public NetManager(INetEventListener listener, TransportType transportType)
+        public NetNode(INetEventListener listener, TransportType transportType)
         {
             _listener = listener;
             _transportType = transportType;
@@ -74,7 +73,7 @@ namespace NetworkLibrary
         // ════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Starts the NetManager in Server mode on the specified port.
+        /// Starts the NetNode in Server mode on the specified port.
         /// </summary>
         /// <param name="port">UDP/TCP port to listen on.</param>
         /// <param name="receiveThreads">
@@ -100,46 +99,10 @@ namespace NetworkLibrary
 
             if (_transportType == TransportType.Udp)
             {
-                _udpServer = new NetworkServer();
-                _udpServer.ConnectionKey = ConnectionKey;
-                _udpServer.ProtocolVersion = ProtocolVersion;
-                if (receiveThreads > 1)
-                    _udpServer.EnableReusePort(receiveThreads);
-
-                _udpServer.OnPeerConnected = (p) =>
-                {
-                    var netPeer = new NetPeer(p.PeerId,
-                        (data, offset, len, method) => _udpServer.Send(p, data, offset, len, method),
-                        () => _udpServer.DisconnectPeer(p),
-                        p.RemoteEndPoint);
-
-                    _peers[p.PeerId] = netPeer;
-                    _listener.OnPeerConnected(netPeer);
-                };
-
-                _udpServer.OnPeerDisconnected = (p) =>
-                {
-                    if (_peers.Remove(p.PeerId, out var netPeer))
-                    {
-                        _listener.OnPeerDisconnected(netPeer, DisconnectReason.PeerDisconnected);
-                    }
-                };
-
-                _udpServer.OnDataReceived = (p, data, offset, len, method) =>
-                {
-                    if (_peers.TryGetValue(p.PeerId, out var netPeer))
-                    {
-                        using var buffer = new BitBuffer();
-                        buffer.FromSpan(new ReadOnlySpan<byte>(data, offset, len));
-                        _listener.OnNetworkReceive(netPeer, buffer, method);
-
-                        _receiveBuffer.Clear();
-                        _receiveBuffer.FromSpan(new ReadOnlySpan<byte>(data, offset, len));
-                        Packets.Dispatch(netPeer, ref _receiveBuffer);
-                    }
-                };
-
-                _udpServer.Start(port);
+                // UDP reliability/ordering/fragmentation/handshake are handled by LiteNetLib inside
+                // LiteNetUdpTransport, which maps each peer to our NetPeer and raises this listener.
+                _udp = new LiteNetUdpTransport(_listener, Packets, ConnectionKey, ProtocolVersion, isServer: true);
+                _udp.StartServer(port);
             }
             else // TCP
             {
@@ -187,9 +150,9 @@ namespace NetworkLibrary
             catch
             {
                 // Bind failed (e.g. port in use) — roll back so Start can be retried.
-                _udpServer?.Stop();
+                _udp?.Stop();
                 _tcpServer?.Stop();
-                _udpServer = null;
+                _udp = null;
                 _tcpServer = null;
                 IsRunning = false;
                 throw;
@@ -201,7 +164,7 @@ namespace NetworkLibrary
         // ════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Starts the NetManager in Client mode and connects to the server.
+        /// Starts the NetNode in Client mode and connects to the server.
         /// </summary>
         public void Connect(string address, int port)
         {
@@ -210,43 +173,8 @@ namespace NetworkLibrary
 
             if (_transportType == TransportType.Udp)
             {
-                _udpClient = new NetworkClient();
-                _udpClient.ConnectionKey = ConnectionKey;
-                _udpClient.ProtocolVersion = ProtocolVersion;
-
-                _udpClient.OnConnected = () =>
-                {
-                    _clientPeer = new NetPeer(0,
-                        (data, offset, len, method) => _udpClient.Send(data, offset, len, method),
-                        () => _udpClient.Disconnect());
-                    
-                    _listener.OnPeerConnected(_clientPeer);
-                };
-
-                _udpClient.OnDisconnected = () =>
-                {
-                    if (_clientPeer != null)
-                    {
-                        _listener.OnPeerDisconnected(_clientPeer, DisconnectReason.PeerDisconnected);
-                        _clientPeer = null;
-                    }
-                };
-
-                _udpClient.OnDataReceived = (data, offset, len, method) =>
-                {
-                    if (_clientPeer != null)
-                    {
-                        using var buffer = new BitBuffer();
-                        buffer.FromSpan(new ReadOnlySpan<byte>(data, offset, len));
-                        _listener.OnNetworkReceive(_clientPeer, buffer, method);
-
-                        _receiveBuffer.Clear();
-                        _receiveBuffer.FromSpan(new ReadOnlySpan<byte>(data, offset, len));
-                        Packets.Dispatch(_clientPeer, ref _receiveBuffer);
-                    }
-                };
-
-                _udpClient.Connect(address, port);
+                _udp = new LiteNetUdpTransport(_listener, Packets, ConnectionKey, ProtocolVersion, isServer: false);
+                _udp.Connect(address, port);
             }
             else // TCP
             {
@@ -297,10 +225,9 @@ namespace NetworkLibrary
         /// </summary>
         public void PollEvents()
         {
-            _udpServer?.Update();
+            _udp?.Poll();
+
             _tcpServer?.Update();
-            
-            _udpClient?.Update();
             _tcpClient?.Update();
         }
 
@@ -310,11 +237,9 @@ namespace NetworkLibrary
         public void Stop()
         {
             IsRunning = false;
-            
-            _udpServer?.Stop();
-            _tcpServer?.Stop();
 
-            _udpClient?.Disconnect();
+            _udp?.Stop();
+            _tcpServer?.Stop();
             _tcpClient?.Disconnect();
 
             _peers.Clear();

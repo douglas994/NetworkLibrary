@@ -7,7 +7,7 @@ using NetworkLibrary.Transport;
 
 namespace NetworkLibrary.Tests
 {
-    public class NetManagerTests
+    public class NetNodeTests
     {
         [Theory]
         [InlineData(TransportType.Tcp, 13000)]
@@ -17,8 +17,8 @@ namespace NetworkLibrary.Tests
             var serverListener = new EventBasedNetListener();
             var clientListener = new EventBasedNetListener();
 
-            using var server = new NetManager(serverListener, transportType);
-            using var client = new NetManager(clientListener, transportType);
+            using var server = new NetNode(serverListener, transportType);
+            using var client = new NetNode(clientListener, transportType);
 
             bool serverClientConnected = false;
             bool clientConnected = false;

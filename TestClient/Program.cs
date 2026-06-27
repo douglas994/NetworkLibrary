@@ -39,8 +39,8 @@ namespace TestClient
                 Console.WriteLine($"[TCP MESSAGE] {reader.ReadString()}");
             };
 
-            var udpClient = new NetManager(udpListener, TransportType.Udp);
-            var tcpClient = new NetManager(tcpListener, TransportType.Tcp);
+            var udpClient = new NetNode(udpListener, TransportType.Udp);
+            var tcpClient = new NetNode(tcpListener, TransportType.Tcp);
 
             udpClient.Connect("127.0.0.1", 7777);
             tcpClient.Connect("127.0.0.1", 7778);

@@ -23,7 +23,7 @@ namespace NetworkLibrary
     }
 
     /// <summary>
-    /// Transport technology used by the NetManager.
+    /// Transport technology used by the NetNode.
     /// </summary>
     public enum TransportType
     {

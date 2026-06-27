@@ -42,8 +42,8 @@ namespace TestServer
                 peer.Send(writer, method);
             };
 
-            var udpServer = new NetManager(listener, TransportType.Udp);
-            var tcpServer = new NetManager(listener, TransportType.Tcp);
+            var udpServer = new NetNode(listener, TransportType.Udp);
+            var tcpServer = new NetNode(listener, TransportType.Tcp);
 
             udpServer.Start(7777);
             tcpServer.Start(7778);

@@ -10,8 +10,12 @@
     <AssemblyName>NetworkLibrary</AssemblyName>
     <OptimizePlusPlus>true</OptimizePlusPlus>
     <Optimize>true</Optimize>
-    <Description>High-performance networking library for MMORPGs. Zero dependencies, zero allocations on hot paths.</Description>
+    <Description>High-performance networking library for MMORPGs. UDP via LiteNetLib, custom TCP, zero allocations on hot paths.</Description>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LiteNetLib" Version="2.1.4" />
+  </ItemGroup>
 
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <DebugType>none</DebugType>
